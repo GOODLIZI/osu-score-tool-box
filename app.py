@@ -21,11 +21,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from PIL import Image, ImageTk
 
-from osu_api import MODES, MODE_NAMES, RULESET_IDS, OsuApi, OsuApiError
+from osu_api import BACKGROUND_KINDS, MODES, MODE_NAMES, RULESET_IDS, OsuApi, OsuApiError, background_urls
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 DEFAULT_REDIRECT_URI = "http://127.0.0.1:5050/callback"
@@ -115,11 +115,17 @@ def normalize_default_mode(value):
     return value if value in MODES else MODES[0]
 
 
+def normalize_image_dir(value):
+    """图片保存位置：字符串，去掉首尾空白，缺失则为空。"""
+    return value.strip() if isinstance(value, str) else ""
+
+
 def normalize_config(config):
-    """统一规范化配置（显示设置 / 成绩获取设置 / 默认模式）。"""
+    """统一规范化配置（显示设置 / 获取与输出设置 / 默认模式 / 图片保存位置）。"""
     normalize_display_config(config)
     normalize_fetch_config(config)
     config["default_mode"] = normalize_default_mode(config.get("default_mode"))
+    config["image_dir"] = normalize_image_dir(config.get("image_dir"))
     return config
 
 
@@ -144,6 +150,17 @@ COMMAND_SPECS = [
         ],
     },
     {
+        "name": "/bg",
+        "kind": "background",
+        "arg_mode": "background",
+        "min_args": 2,
+        "max_args": 2,
+        "forms": [
+            ("/bg full 谱面编号", "下载该谱面的背景原图（fullsize）"),
+            ("/bg cover 谱面编号", "下载该谱面的裁剪缩略图（cover）"),
+        ],
+    },
+    {
         "name": "/bp",
         "kind": "best",
         "min_args": 0,
@@ -161,6 +178,7 @@ COMMAND_RULES = [
     "一次最多获取 %d 条成绩。" % FETCH_LIMIT_MAX,
     "指令作用于当前选中的模式。",
     "最近成绩受 osu! API 限制：只包含最近 24 小时内、且最多取到第 100 个。",
+    "获取背景图前需先在「获取与输出设置」里设置图片保存位置。",
 ]
 
 
@@ -194,6 +212,18 @@ def parse_command(text):
     if not (spec["min_args"] <= len(raw_args) <= spec["max_args"]):
         raise CommandError("指令 %s 的参数个数不正确。\n可用形式：\n%s" % (
             spec["name"], "\n".join("    " + form + "    " + desc for form, desc in spec["forms"])))
+    if spec.get("arg_mode") == "background":
+        kind_raw = raw_args[0].lower()
+        if kind_raw not in BACKGROUND_KINDS:
+            raise CommandError("图片种类必须是 full 或 cover（例如 /bg full 1122334）。")
+        number_raw = raw_args[1]
+        try:
+            beatmap_id = int(number_raw)
+        except ValueError:
+            raise CommandError("谱面编号必须是正整数：%s" % number_raw)
+        if beatmap_id < 1:
+            raise CommandError("谱面编号必须是正整数：%s" % number_raw)
+        return spec, [kind_raw, beatmap_id]
     args = []
     for raw in raw_args:
         try:
@@ -808,17 +838,18 @@ class DisplaySettingsDialog:
 
 
 class FetchSettingsDialog:
-    """成绩获取设置弹窗：按模式配置最近 / 最佳成绩的默认数量（1~100）。"""
+    """「获取与输出设置」弹窗：配置成绩获取数量与图片保存位置。"""
 
-    def __init__(self, parent, fetch_config, on_save):
+    def __init__(self, parent, fetch_config, on_save, image_dir=""):
         self.on_save = on_save
         self.draft = normalize_fetch_section(fetch_config)
+        self.image_dir = normalize_image_dir(image_dir)
         self.vars = {}  # (mode, kind) -> StringVar
 
         self.window = tk.Toplevel(parent)
-        self.window.title("成绩获取设置")
-        self.window.geometry("430x330")
-        self.window.minsize(400, 320)
+        self.window.title("获取与输出设置")
+        self.window.geometry("520x430")
+        self.window.minsize(480, 410)
         self.window.transient(parent)
         self.window.grab_set()
 
@@ -829,21 +860,30 @@ class FetchSettingsDialog:
         body = ttk.Frame(self.window, padding=12)
         body.pack(fill="both", expand=True)
 
-        ttk.Label(body, text="模式").grid(row=0, column=0, padx=6, pady=4, sticky="w")
+        fetch_frame = ttk.LabelFrame(body, text=" 成绩获取数量 ", padding=8)
+        fetch_frame.pack(fill="x")
+        ttk.Label(fetch_frame, text="模式").grid(row=0, column=0, padx=6, pady=4, sticky="w")
         for col, kind in enumerate(FETCH_KINDS, start=1):
-            ttk.Label(body, text=FETCH_KIND_LABELS[kind]).grid(row=0, column=col, padx=10, pady=4)
-
+            ttk.Label(fetch_frame, text=FETCH_KIND_LABELS[kind]).grid(row=0, column=col, padx=10, pady=4)
         for row, mode in enumerate(MODES, start=1):
-            ttk.Label(body, text=MODE_UI_NAMES[mode]).grid(row=row, column=0, padx=6, pady=4, sticky="w")
+            ttk.Label(fetch_frame, text=MODE_UI_NAMES[mode]).grid(row=row, column=0, padx=6, pady=4, sticky="w")
             for col, kind in enumerate(FETCH_KINDS, start=1):
                 var = tk.StringVar()
                 self.vars[(mode, kind)] = var
-                ttk.Spinbox(body, from_=1, to=FETCH_LIMIT_MAX, width=6,
+                ttk.Spinbox(fetch_frame, from_=1, to=FETCH_LIMIT_MAX, width=6,
                             textvariable=var).grid(row=row, column=col, padx=10, pady=4)
-
-        ttk.Label(body, text="数量范围 1~%d，超出的取值会被限制。" % FETCH_LIMIT_MAX,
+        ttk.Label(fetch_frame, text="数量范围 1~%d，超出的取值会被限制。" % FETCH_LIMIT_MAX,
                   foreground="#666").grid(row=len(MODES) + 1, column=0, columnspan=3,
-                                          sticky="w", padx=6, pady=(10, 0))
+                                          sticky="w", padx=6, pady=(6, 0))
+
+        image_frame = ttk.LabelFrame(body, text=" 图片保存位置 ", padding=8)
+        image_frame.pack(fill="x", pady=(10, 0))
+        self.image_dir_var = tk.StringVar(value=self.image_dir)
+        ttk.Entry(image_frame, textvariable=self.image_dir_var).pack(
+            side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Button(image_frame, text="选择文件夹…", command=self._choose_dir).pack(side="left")
+        ttk.Label(body, text="谱面背景图会保存到该文件夹（可留空，获取时会提示设置）。",
+                  foreground="#666").pack(anchor="w", pady=(4, 0))
         self._load()
 
         buttons = ttk.Frame(self.window, padding=10)
@@ -856,11 +896,20 @@ class FetchSettingsDialog:
     def _load(self):
         for (mode, kind), var in self.vars.items():
             var.set(str(self.draft[mode][kind]))
+        self.image_dir_var.set(self.image_dir)
 
     def _reset(self):
         defaults = default_fetch_settings()
         for (mode, kind), var in self.vars.items():
             var.set(str(defaults[kind]))
+        self.image_dir_var.set("")
+
+    def _choose_dir(self):
+        current = (self.image_dir_var.get() or "").strip()
+        initial = current if os.path.isdir(current) else os.getcwd()
+        path = filedialog.askdirectory(parent=self.window, title="选择图片保存位置", initialdir=initial)
+        if path:
+            self.image_dir_var.set(os.path.abspath(path))
 
     def _collect(self):
         result = {mode: {} for mode in MODES}
@@ -876,13 +925,75 @@ class FetchSettingsDialog:
             result[mode][kind] = value
         return result
 
+    def _collect_image_dir(self):
+        raw = (self.image_dir_var.get() or "").strip()
+        if not raw:
+            return ""
+        path = os.path.abspath(raw)
+        if not os.path.isdir(path):
+            raise InputError("图片保存位置不存在：%s" % path)
+        return path
+
     def _ok(self):
         try:
             result = self._collect()
+            image_dir = self._collect_image_dir()
         except InputError as exc:
-            messagebox.showwarning("成绩获取设置", str(exc), parent=self.window)
+            messagebox.showwarning("获取与输出设置", str(exc), parent=self.window)
             return
-        self.on_save(result)
+        self.on_save(result, image_dir)
+        self.window.destroy()
+
+
+class BackgroundDialog:
+    """「获取谱面背景图」弹窗：输入谱面编号并选择图片种类。"""
+
+    def __init__(self, parent):
+        self.result = None
+        self.window = tk.Toplevel(parent)
+        self.window.title("获取谱面背景图")
+        self.window.geometry("440x210")
+        self.window.minsize(420, 200)
+        self.window.transient(parent)
+        self.window.grab_set()
+
+        body = ttk.Frame(self.window, padding=12)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(body, text="谱面编号：").grid(row=0, column=0, sticky="w", pady=6)
+        self.id_var = tk.StringVar()
+        entry = ttk.Entry(body, textvariable=self.id_var, width=20)
+        entry.grid(row=0, column=1, sticky="w", pady=6)
+        entry.focus_set()
+        entry.bind("<Return>", lambda event: self._ok())
+
+        ttk.Label(body, text="图片种类：").grid(row=1, column=0, sticky="w", pady=6)
+        self.kind_var = tk.StringVar(value="full")
+        kind_box = ttk.Frame(body)
+        kind_box.grid(row=1, column=1, sticky="w", pady=6)
+        for i, kind in enumerate(BACKGROUND_KINDS):
+            ttk.Radiobutton(kind_box, text="%s（%s）" % (kind, BACKGROUND_KINDS[kind]), value=kind,
+                            variable=self.kind_var).grid(row=0, column=i, padx=(0, 12))
+
+        ttk.Label(body, text="full = 背景原图（fullsize）；cover = 裁剪缩略图",
+                  foreground="#666").grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        buttons = ttk.Frame(self.window, padding=10)
+        buttons.pack(fill="x", side="bottom")
+        ttk.Button(buttons, text="取消", command=self.window.destroy).pack(side="right", padx=4)
+        ttk.Button(buttons, text="获取", command=self._ok).pack(side="right", padx=4)
+
+    def _ok(self):
+        raw = (self.id_var.get() or "").strip()
+        try:
+            beatmap_id = int(raw)
+        except ValueError:
+            messagebox.showwarning("获取谱面背景图", "请输入有效的谱面编号（正整数）。", parent=self.window)
+            return
+        if beatmap_id < 1:
+            messagebox.showwarning("获取谱面背景图", "谱面编号必须是正整数。", parent=self.window)
+            return
+        self.result = (beatmap_id, self.kind_var.get())
         self.window.destroy()
 
 
@@ -924,7 +1035,7 @@ class App:
         ttk.Button(top, text="删除账号", command=self.on_delete_account).pack(side="left", padx=4)
         ttk.Button(top, text="API设置", command=self.on_api_settings).pack(side="left", padx=4)
         ttk.Button(top, text="显示设置", command=self.on_display_settings).pack(side="left", padx=4)
-        ttk.Button(top, text="成绩获取设置", command=self.on_fetch_settings).pack(side="left", padx=4)
+        ttk.Button(top, text="获取与输出设置", command=self.on_fetch_settings).pack(side="left", padx=4)
 
         # 玩家信息区
         info = ttk.Frame(self.root, padding=8)
@@ -978,6 +1089,8 @@ class App:
         ttk.Button(actions, text="最佳成绩", command=self.on_best).pack(
             side="left", padx=6, expand=True, fill="x")
         ttk.Button(actions, text="刷新数据", command=self.on_refresh).pack(
+            side="left", padx=6, expand=True, fill="x")
+        ttk.Button(actions, text="获取背景图", command=self.on_get_background).pack(
             side="left", padx=6, expand=True, fill="x")
 
         # 指令输入
@@ -1193,15 +1306,26 @@ class App:
             self._set_status("已复制%s（%d 条）到剪贴板" % (label, got))
 
     # ---------- 指令 ----------
+    def _show_command_error(self, msg):
+        self._set_status("指令错误：%s" % str(msg).splitlines()[0])
+        messagebox.showwarning("指令错误", str(msg), parent=self.root)
+
     def on_run_command(self):
         text = self.command_var.get() if hasattr(self, "command_var") else ""
         try:
             spec, args = parse_command(text)
+        except CommandError as exc:
+            self._show_command_error(exc)
+            return
+        # 背景图指令：/bg full|cover 谱面编号
+        if spec["kind"] == "background":
+            img_kind, beatmap_id = args
+            self._start_background_download(beatmap_id, img_kind)
+            return
+        try:
             offset, limit = resolve_range(spec, args)
         except CommandError as exc:
-            msg = str(exc)
-            self._set_status("指令错误：%s" % msg.splitlines()[0])
-            messagebox.showwarning("指令错误", msg, parent=self.root)
+            self._show_command_error(exc)
             return
         account = self._require_account()
         if not account:
@@ -1348,14 +1472,86 @@ class App:
             section = self.config["fetch"]
         return section[mode]
 
-    def _apply_fetch_settings(self, fetch):
+    def _apply_fetch_settings(self, fetch, image_dir=None):
         self.config["fetch"] = normalize_fetch_section(fetch)
+        self.config["image_dir"] = normalize_image_dir(image_dir)
         self._save_config()
-        self._set_status("成绩获取设置已保存（按模式分别生效）")
+        self._set_status("获取与输出设置已保存（按模式分别生效）")
 
     def on_fetch_settings(self):
-        dialog = FetchSettingsDialog(self.root, self.config.get("fetch"), self._apply_fetch_settings)
+        dialog = FetchSettingsDialog(
+            self.root, self.config.get("fetch"), self._apply_fetch_settings,
+            image_dir=self.config.get("image_dir"),
+        )
         self.root.wait_window(dialog.window)
+
+    # ---------- 谱面背景图 ----------
+    def _resolve_image_dir(self):
+        """检查图片保存位置；未设置时提示并直接打开「获取与输出设置」。"""
+        image_dir = normalize_image_dir(self.config.get("image_dir"))
+        if not image_dir:
+            self._set_status("请设置下载路径后获取背景图")
+            messagebox.showwarning("提示", "请设置下载路径后获取背景图", parent=self.root)
+            self.on_fetch_settings()
+            return None
+        if not os.path.isdir(image_dir):
+            msg = "图片保存位置不存在：%s" % image_dir
+            self._set_status(msg)
+            messagebox.showerror("错误", msg, parent=self.root)
+            return None
+        return image_dir
+
+    def on_get_background(self):
+        if self._resolve_image_dir() is None:
+            return
+        dialog = BackgroundDialog(self.root)
+        self.root.wait_window(dialog.window)
+        if not dialog.result:
+            return
+        beatmap_id, kind = dialog.result
+        self._start_background_download(beatmap_id, kind)
+
+    def _start_background_download(self, beatmap_id, kind):
+        image_dir = self._resolve_image_dir()
+        if image_dir is None:
+            return
+        account = self._require_account()
+        if not account:
+            return
+        self._set_status("正在获取谱面背景图（%s %s）…" % (beatmap_id, kind))
+        self._background(
+            lambda: self._fetch_background(account, beatmap_id, kind, image_dir),
+            self._apply_background,
+            error_msg="获取背景图失败",
+        )
+
+    def _fetch_background(self, account, beatmap_id, kind, image_dir):
+        """解析 beatmapset_id 并下载背景图，返回保存路径。"""
+        beatmap = self.api.get_beatmap(account, beatmap_id)
+        set_id = beatmap.get("beatmapset_id")
+        if not set_id:
+            raise OsuApiError(0, "该谱面没有关联的谱面集，无法获取背景图")
+        for url in background_urls(set_id, kind):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "osu-scores-tool"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = resp.read()
+            except Exception:
+                continue
+            if not data:
+                continue
+            path = os.path.join(image_dir, "%d %s.jpg" % (beatmap_id, kind))
+            try:
+                with open(path, "wb") as f:
+                    f.write(data)
+            except OSError as exc:
+                raise OsuApiError(0, "无法写入文件：%s" % exc)
+            return path
+        raise OsuApiError(0, "该谱面没有可下载的%s" % BACKGROUND_KINDS.get(kind, "背景图"))
+
+    def _apply_background(self, path):
+        self._save_config()
+        self._set_status("已保存背景图：%s" % path)
 
     # ---------- 令牌持久化 ----------
     def _on_token_refresh(self, account):

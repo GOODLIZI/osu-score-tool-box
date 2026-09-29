@@ -26,6 +26,19 @@ MODES = list(MODE_NAMES.keys())
 # API v2 ruleset_id -> 模式名（用于谱面属性计算等）
 RULESET_IDS = {0: "osu", 1: "taiko", 2: "fruits", 3: "mania"}
 
+# 谱面背景图（assets.ppy.sh 是公开 CDN，下载不需要鉴权）
+# full  = fullsize.jpg（谱师上传的背景原图，未裁剪）
+# cover = cover@2x.jpg（裁剪缩略图，缺图时回退 cover.jpg）
+BACKGROUND_KINDS = {"full": "背景原图", "cover": "裁剪缩略图"}
+_BACKGROUND_SIZES = {"full": ("fullsize",), "cover": ("cover@2x", "cover")}
+
+
+def background_urls(beatmapset_id, kind):
+    """按种类返回背景图候选 URL（按顺序尝试，前面的优先）。"""
+    sizes = _BACKGROUND_SIZES.get(kind) or _BACKGROUND_SIZES["full"]
+    return ["https://assets.ppy.sh/beatmaps/%s/covers/%s.jpg" % (beatmapset_id, size)
+            for size in sizes]
+
 
 class OsuApiError(Exception):
     """携带 HTTP 状态码的 API 错误。code 为 0 表示网络类错误。"""
@@ -166,6 +179,10 @@ class OsuApi:
             account,
             params,
         )
+
+    def get_beatmap(self, account, beatmap_id):
+        """获取单个谱面信息（包含 beatmapset_id，用于定位背景图）。"""
+        return self._call("/beatmaps/%s" % beatmap_id, account)
 
     def get_beatmap_attributes(self, account, beatmap_id, mods, ruleset=None):
         """获取指定谱面在给定模组下的难度属性，返回带模组星数（star_rating）。
