@@ -154,8 +154,13 @@ class OsuApi:
     def get_me(self, account):
         return self._call("/me", account)
 
-    def get_user(self, account, mode):
-        return self._call("/users/%s" % account["user_id"], account, {"mode": mode})
+    def get_user(self, account, mode=None):
+        # 模式必须作为路径参数（/users/{id}/{mode}）；写成查询参数 ?mode= 会被 API 忽略，
+        # 导致切换模式时玩家信息（pp/时长等）始终停留在主模式的统计上。
+        path = "/users/%s" % account["user_id"]
+        if mode:
+            path += "/%s" % mode
+        return self._call(path, account)
 
     def get_recent_scores(self, account, mode, limit=1, offset=0):
         # 默认同时返回 stable(legacy) 与 lazer(solo) 成绩；来源可通过成绩的 best_id 区分

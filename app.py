@@ -86,6 +86,30 @@ def default_fetch_settings():
     return dict(DEFAULT_FETCH_LIMITS)
 
 
+# 成绩输出方式：clipboard = 剪贴板，txt = 写入 txt 文件
+OUTPUT_MODES = ("clipboard", "txt")
+OUTPUT_MODE_LABELS = {"clipboard": "输出至剪贴板", "txt": "输出至 txt 文件"}
+OUTPUT_MODE_SUFFIX = {"-copy": "clipboard", "-txt": "txt"}
+
+
+def normalize_output_mode(value):
+    """成绩输出方式：非法值回退剪贴板。"""
+    return value if value in OUTPUT_MODES else OUTPUT_MODES[0]
+
+
+def normalize_dir(value):
+    """目录设置（图片/成绩保存位置）：字符串并去掉首尾空白。"""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def score_output_filename(prefix, start=None, end=None, now=None):
+    """成绩 txt 文件名：Bestplay / Recent + [起-止] + 时间（精确到分钟）。"""
+    stamp = time.strftime("%Y-%m-%d %H-%M", time.localtime(time.time() if now is None else now))
+    if start is None or end is None:
+        return "%s %s.txt" % (prefix, stamp)
+    return "%s %d-%d %s.txt" % (prefix, start, end, stamp)
+
+
 def _normalize_limit(value, default):
     """把数量规范化为 1~100 的整数，非法值回退默认。"""
     try:
@@ -115,17 +139,14 @@ def normalize_default_mode(value):
     return value if value in MODES else MODES[0]
 
 
-def normalize_image_dir(value):
-    """图片保存位置：字符串，去掉首尾空白，缺失则为空。"""
-    return value.strip() if isinstance(value, str) else ""
-
-
 def normalize_config(config):
-    """统一规范化配置（显示设置 / 获取与输出设置 / 默认模式 / 图片保存位置）。"""
+    """统一规范化配置（显示设置 / 获取与输出设置 / 默认模式 / 保存位置）。"""
     normalize_display_config(config)
     normalize_fetch_config(config)
     config["default_mode"] = normalize_default_mode(config.get("default_mode"))
-    config["image_dir"] = normalize_image_dir(config.get("image_dir"))
+    config["image_dir"] = normalize_dir(config.get("image_dir"))
+    config["score_dir"] = normalize_dir(config.get("score_dir"))
+    config["output_mode"] = normalize_output_mode(config.get("output_mode"))
     return config
 
 
@@ -147,6 +168,7 @@ COMMAND_SPECS = [
             ("/r", "获取最新的 1 个成绩"),
             ("/r a", "获取最近的 a 个成绩（1 ≤ a ≤ 100）"),
             ("/r a b", "获取最近第 a 到第 b 个成绩（a < b，数量 ≤ 100）"),
+            ("/r <形式> -copy|-txt", "在末尾指定本次输出方式：-copy 剪贴板，-txt txt 文件"),
         ],
     },
     {
@@ -169,6 +191,7 @@ COMMAND_SPECS = [
             ("/bp", "获取单曲 pp 最高的 1 个成绩"),
             ("/bp a", "获取单曲 pp 最高的 a 个成绩（1 ≤ a ≤ 100）"),
             ("/bp a b", "获取第 a 高到第 b 高的成绩（a < b，数量 ≤ 100）"),
+            ("/bp <形式> -copy|-txt", "在末尾指定本次输出方式：-copy 剪贴板，-txt txt 文件"),
         ],
     },
 ]
@@ -178,6 +201,9 @@ COMMAND_RULES = [
     "一次最多获取 %d 条成绩。" % FETCH_LIMIT_MAX,
     "指令作用于当前选中的模式。",
     "最近成绩受 osu! API 限制：只包含最近 24 小时内、且最多取到第 100 个。",
+    "取成绩指令（/r、/bp）默认使用「获取与输出设置」里的成绩默认输出方式，",
+    "可在末尾加 -copy 或 -txt 覆盖本次输出方式，例如 /bp 1 5 -txt。",
+    "输出 txt 需要先设置「成绩信息 txt」保存位置；同一分钟内生成同名文件会提示「获取间隔过短」。",
     "获取背景图前需先在「获取与输出设置」里设置图片保存位置。",
 ]
 
@@ -200,7 +226,10 @@ def find_command_spec(name):
 
 
 def parse_command(text):
-    """解析指令文本，返回 (spec, args)；出错抛出 CommandError。"""
+    """解析指令文本，返回 (spec, args, output_override)；出错抛出 CommandError。
+
+    /r、/bp 允许在末尾追加 -copy / -txt，指定本次输出方式（覆盖默认输出方式）。
+    """
     tokens = (text or "").split()
     if not tokens:
         raise CommandError("请输入指令，例如 /r 3 5 或 /bp 20。")
@@ -209,6 +238,12 @@ def parse_command(text):
         raise CommandError("未知指令：%s\n可用指令：%s\n（可点击「指令帮助」查看全部指令）" % (
             tokens[0], "、".join(item["name"] for item in COMMAND_SPECS)))
     raw_args = tokens[1:]
+    output_override = None
+    if raw_args and spec["kind"] in ("recent", "best"):
+        suffix = raw_args[-1].lower()
+        if suffix in OUTPUT_MODE_SUFFIX:
+            output_override = OUTPUT_MODE_SUFFIX[suffix]
+            raw_args = raw_args[:-1]
     if not (spec["min_args"] <= len(raw_args) <= spec["max_args"]):
         raise CommandError("指令 %s 的参数个数不正确。\n可用形式：\n%s" % (
             spec["name"], "\n".join("    " + form + "    " + desc for form, desc in spec["forms"])))
@@ -223,7 +258,7 @@ def parse_command(text):
             raise CommandError("谱面编号必须是正整数：%s" % number_raw)
         if beatmap_id < 1:
             raise CommandError("谱面编号必须是正整数：%s" % number_raw)
-        return spec, [kind_raw, beatmap_id]
+        return spec, [kind_raw, beatmap_id], output_override
     args = []
     for raw in raw_args:
         try:
@@ -233,7 +268,7 @@ def parse_command(text):
         if value < 1:
             raise CommandError("参数必须是正整数：%s" % raw)
         args.append(value)
-    return spec, args
+    return spec, args, output_override
 
 
 def resolve_range(spec, args):
@@ -679,8 +714,6 @@ class DisplaySettingsDialog:
 
         self.window = tk.Toplevel(parent)
         self.window.title("显示设置")
-        self.window.geometry("580x730")
-        self.window.minsize(540, 690)
         self.window.transient(parent)
         self.window.grab_set()
 
@@ -696,26 +729,44 @@ class DisplaySettingsDialog:
 
         self._build()
         self._load_mode(self.current_mode)
+        self._fit_window()
+
+    def _fit_window(self):
+        """按内容自适应窗口尺寸并限制在屏幕内，避免底部按钮被挤出可视区。"""
+        self.window.update_idletasks()
+        width = min(max(self.window.winfo_reqwidth(), 820), self.window.winfo_screenwidth() - 80)
+        height = min(max(self.window.winfo_reqheight(), 500), self.window.winfo_screenheight() - 120)
+        self.window.geometry("%dx%d" % (width, height))
+        self.window.minsize(min(width, 760), min(height, 460))
 
     # ---------- 界面 ----------
     def _build(self):
-        mode_frame = ttk.LabelFrame(self.window, text=" 默认模式 ", padding=6)
-        mode_frame.pack(fill="x", padx=10, pady=(10, 4))
+        # 整体分左右两栏：左 = 默认模式 + 显示字段；右 = 选项 + 预览
+        body = ttk.Frame(self.window, padding=10)
+        body.pack(fill="both", expand=True)
+
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(body)
+        right.pack(side="left", fill="both", expand=True, padx=(10, 0))
+
+        mode_frame = ttk.LabelFrame(left, text=" 默认模式 ", padding=6)
+        mode_frame.pack(fill="x")
         for i, mode in enumerate(MODES):
             ttk.Radiobutton(
                 mode_frame, text=MODE_UI_NAMES[mode], value=mode,
                 variable=self.mode_var, command=self._on_mode_change,
             ).grid(row=0, column=i, padx=6, pady=2)
-        ttk.Label(mode_frame, text="启动程序时默认进入该模式，同时决定下方设置所对应的模式",
+        ttk.Label(mode_frame, text="启动程序时默认进入该模式，同时决定右侧设置所对应的模式",
                   foreground="#666").grid(row=1, column=0, columnspan=len(MODES), sticky="w", padx=6)
 
-        fields_frame = ttk.LabelFrame(self.window, text=" 显示字段（勾选显示，↑↓ 调整顺序） ", padding=6)
-        fields_frame.pack(fill="x", padx=10, pady=4)
+        fields_frame = ttk.LabelFrame(left, text=" 显示字段（勾选显示，↑↓ 调整顺序） ", padding=6)
+        fields_frame.pack(fill="both", expand=True, pady=(8, 0))
         self.fields_inner = ttk.Frame(fields_frame)
         self.fields_inner.pack(fill="x")
 
-        opts = ttk.LabelFrame(self.window, text=" 选项 ", padding=8)
-        opts.pack(fill="x", padx=10, pady=4)
+        opts = ttk.LabelFrame(right, text=" 选项 ", padding=8)
+        opts.pack(fill="x")
         ttk.Checkbutton(opts, text="在曲名前显示谱面状态", variable=self.beatmap_status_var,
                         command=self._touch).grid(row=0, column=0, sticky="w", columnspan=3)
         ttk.Checkbutton(opts, text="在难度名后显示谱面编号", variable=self.beatmap_id_var,
@@ -739,16 +790,17 @@ class DisplaySettingsDialog:
             ttk.Radiobutton(pp_box, text=PP_STYLE_LABELS[style], value=style,
                             variable=self.pp_var, command=self._touch).grid(row=0, column=i, padx=(0, 10))
 
-        preview_frame = ttk.LabelFrame(self.window, text=" 预览 ", padding=8)
-        preview_frame.pack(fill="x", padx=10, pady=4)
-        self.preview_label = ttk.Label(preview_frame, text="", wraplength=500, justify="left")
+        preview_frame = ttk.LabelFrame(right, text=" 预览 ", padding=8)
+        preview_frame.pack(fill="both", expand=True, pady=(8, 0))
+        self.preview_label = ttk.Label(preview_frame, text="", wraplength=380, justify="left")
         self.preview_label.pack(anchor="w")
 
+        # 底部按钮：全部靠左排列（恢复默认 | 确定 | 取消）
         buttons = ttk.Frame(self.window, padding=10)
         buttons.pack(fill="x", side="bottom")
         ttk.Button(buttons, text="恢复本模式默认", command=self._reset_mode).pack(side="left")
-        ttk.Button(buttons, text="取消", command=self.window.destroy).pack(side="right", padx=4)
-        ttk.Button(buttons, text="确定", command=self._ok).pack(side="right", padx=4)
+        ttk.Button(buttons, text="确定", command=self._ok).pack(side="left", padx=(10, 4))
+        ttk.Button(buttons, text="取消", command=self.window.destroy).pack(side="left", padx=4)
 
     def _rebuild_rows(self):
         for child in self.fields_inner.winfo_children():
@@ -838,18 +890,20 @@ class DisplaySettingsDialog:
 
 
 class FetchSettingsDialog:
-    """「获取与输出设置」弹窗：配置成绩获取数量与图片保存位置。"""
+    """「获取与输出设置」弹窗：成绩获取数量、默认输出方式与保存位置。"""
 
-    def __init__(self, parent, fetch_config, on_save, image_dir=""):
+    def __init__(self, parent, fetch_config, on_save, image_dir="", score_dir="", output_mode="clipboard"):
         self.on_save = on_save
         self.draft = normalize_fetch_section(fetch_config)
-        self.image_dir = normalize_image_dir(image_dir)
+        self.image_dir = normalize_dir(image_dir)
+        self.score_dir = normalize_dir(score_dir)
+        self.output_mode = normalize_output_mode(output_mode)
         self.vars = {}  # (mode, kind) -> StringVar
 
         self.window = tk.Toplevel(parent)
         self.window.title("获取与输出设置")
-        self.window.geometry("520x430")
-        self.window.minsize(480, 410)
+        self.window.geometry("580x580")
+        self.window.minsize(540, 540)
         self.window.transient(parent)
         self.window.grab_set()
 
@@ -876,14 +930,31 @@ class FetchSettingsDialog:
                   foreground="#666").grid(row=len(MODES) + 1, column=0, columnspan=3,
                                           sticky="w", padx=6, pady=(6, 0))
 
-        image_frame = ttk.LabelFrame(body, text=" 图片保存位置 ", padding=8)
-        image_frame.pack(fill="x", pady=(10, 0))
-        self.image_dir_var = tk.StringVar(value=self.image_dir)
-        ttk.Entry(image_frame, textvariable=self.image_dir_var).pack(
-            side="left", fill="x", expand=True, padx=(0, 6))
-        ttk.Button(image_frame, text="选择文件夹…", command=self._choose_dir).pack(side="left")
-        ttk.Label(body, text="谱面背景图会保存到该文件夹（可留空，获取时会提示设置）。",
-                  foreground="#666").pack(anchor="w", pady=(4, 0))
+        out_frame = ttk.LabelFrame(body, text=" 成绩默认输出方式 ", padding=8)
+        out_frame.pack(fill="x", pady=(10, 0))
+        self.output_mode_var = tk.StringVar(value=self.output_mode)
+        for i, mode in enumerate(OUTPUT_MODES):
+            ttk.Radiobutton(out_frame, text=OUTPUT_MODE_LABELS[mode], value=mode,
+                            variable=self.output_mode_var).grid(row=0, column=i, padx=(0, 18), sticky="w")
+
+        loc_frame = ttk.LabelFrame(body, text=" 保存位置 ", padding=8)
+        loc_frame.pack(fill="x", pady=(10, 0))
+        loc_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(loc_frame, text="成绩信息 txt：").grid(row=0, column=0, sticky="w", pady=4)
+        self.score_dir_var = tk.StringVar()
+        ttk.Entry(loc_frame, textvariable=self.score_dir_var).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(loc_frame, text="选择文件夹…",
+                   command=lambda: self._choose_dir(self.score_dir_var)).grid(row=0, column=2)
+
+        ttk.Label(loc_frame, text="背景图片：").grid(row=1, column=0, sticky="w", pady=4)
+        self.image_dir_var = tk.StringVar()
+        ttk.Entry(loc_frame, textvariable=self.image_dir_var).grid(row=1, column=1, sticky="ew", padx=6)
+        ttk.Button(loc_frame, text="选择文件夹…",
+                   command=lambda: self._choose_dir(self.image_dir_var)).grid(row=1, column=2)
+
+        ttk.Label(body, text="保存位置可留空；获取时若需要而未设置，会提示设置。",
+                  foreground="#666").pack(anchor="w", pady=(6, 0))
         self._load()
 
         buttons = ttk.Frame(self.window, padding=10)
@@ -896,20 +967,24 @@ class FetchSettingsDialog:
     def _load(self):
         for (mode, kind), var in self.vars.items():
             var.set(str(self.draft[mode][kind]))
+        self.output_mode_var.set(self.output_mode)
+        self.score_dir_var.set(self.score_dir)
         self.image_dir_var.set(self.image_dir)
 
     def _reset(self):
         defaults = default_fetch_settings()
         for (mode, kind), var in self.vars.items():
             var.set(str(defaults[kind]))
+        self.output_mode_var.set(OUTPUT_MODES[0])
+        self.score_dir_var.set("")
         self.image_dir_var.set("")
 
-    def _choose_dir(self):
-        current = (self.image_dir_var.get() or "").strip()
+    def _choose_dir(self, var):
+        current = (var.get() or "").strip()
         initial = current if os.path.isdir(current) else os.getcwd()
-        path = filedialog.askdirectory(parent=self.window, title="选择图片保存位置", initialdir=initial)
+        path = filedialog.askdirectory(parent=self.window, title="选择保存位置", initialdir=initial)
         if path:
-            self.image_dir_var.set(os.path.abspath(path))
+            var.set(os.path.abspath(path))
 
     def _collect(self):
         result = {mode: {} for mode in MODES}
@@ -925,23 +1000,25 @@ class FetchSettingsDialog:
             result[mode][kind] = value
         return result
 
-    def _collect_image_dir(self):
-        raw = (self.image_dir_var.get() or "").strip()
+    @staticmethod
+    def _collect_dir(value, label):
+        raw = (value or "").strip()
         if not raw:
             return ""
         path = os.path.abspath(raw)
         if not os.path.isdir(path):
-            raise InputError("图片保存位置不存在：%s" % path)
+            raise InputError("%s不存在：%s" % (label, path))
         return path
 
     def _ok(self):
         try:
             result = self._collect()
-            image_dir = self._collect_image_dir()
+            score_dir = self._collect_dir(self.score_dir_var.get(), "成绩信息 txt 保存位置")
+            image_dir = self._collect_dir(self.image_dir_var.get(), "图片保存位置")
         except InputError as exc:
             messagebox.showwarning("获取与输出设置", str(exc), parent=self.window)
             return
-        self.on_save(result, image_dir)
+        self.on_save(result, score_dir, image_dir, self.output_mode_var.get())
         self.window.destroy()
 
 
@@ -1010,6 +1087,8 @@ class App:
         self.current_account = None
         self.current_mode = tk.StringVar(value=self.config.get("default_mode", "osu"))
         self.avatar_img = None
+        self.main_mode = None  # 玩家账号的主模式（来自 user.playmode）
+        self.mode_buttons = {}
         self._star_cache = {}  # (谱面id, 模组元组, 规则) -> 带模组星数或 None
         self._build_ui()
         self._reload_account_list()
@@ -1032,7 +1111,6 @@ class App:
         self.account_combo.pack(side="left", padx=4)
         self.account_combo.bind("<<ComboboxSelected>>", self._on_account_selected)
         ttk.Button(top, text="绑定账号", command=self.on_bind).pack(side="left", padx=4)
-        ttk.Button(top, text="删除账号", command=self.on_delete_account).pack(side="left", padx=4)
         ttk.Button(top, text="API设置", command=self.on_api_settings).pack(side="left", padx=4)
         ttk.Button(top, text="显示设置", command=self.on_display_settings).pack(side="left", padx=4)
         ttk.Button(top, text="获取与输出设置", command=self.on_fetch_settings).pack(side="left", padx=4)
@@ -1076,10 +1154,12 @@ class App:
         mode_frame = ttk.LabelFrame(self.root, text=" 模式 ", padding=8)
         mode_frame.pack(fill="x", padx=8, pady=4)
         for i, mode in enumerate(MODES):
-            ttk.Radiobutton(
-                mode_frame, text=MODE_UI_NAMES[mode], value=mode,
+            button = ttk.Radiobutton(
+                mode_frame, text=self._mode_label(mode), value=mode,
                 variable=self.current_mode, command=self._on_mode_changed,
-            ).grid(row=0, column=i, padx=10, pady=4)
+            )
+            button.grid(row=0, column=i, padx=10, pady=4)
+            self.mode_buttons[mode] = button
 
         # 功能按钮
         actions = ttk.Frame(self.root, padding=8)
@@ -1104,10 +1184,15 @@ class App:
         ttk.Button(cmd, text="执行", command=self.on_run_command).pack(side="left", padx=(0, 6))
         ttk.Button(cmd, text="指令帮助", command=self.on_command_help).pack(side="left")
 
-        # 状态栏
+        # 底部：状态栏 + 右下角「删除账号」（标红，降低误触风险）
+        bottom = ttk.Frame(self.root)
+        bottom.pack(side="bottom", fill="x")
+        self.delete_button = tk.Button(bottom, text="删除账号", fg="#c00000", activeforeground="#c00000",
+                                       command=self.on_delete_account)
+        self.delete_button.pack(side="right", padx=(6, 8), pady=3)
         self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(self.root, textvariable=self.status_var, anchor="w",
-                  relief="sunken", padding=4).pack(side="bottom", fill="x")
+        ttk.Label(bottom, textvariable=self.status_var, anchor="w",
+                  relief="sunken", padding=4).pack(side="left", fill="x", expand=True)
 
     # ---------- 账号列表 ----------
     def _reload_account_list(self):
@@ -1170,6 +1255,9 @@ class App:
         self.stat_labels["global_rank"].config(text=self._fmt_rank(stats.get("global_rank")))
         self.stat_labels["play_count"].config(text=self._fmt_num(stats.get("play_count")))
         self.stat_labels["play_time"].config(text=format_duration(stats.get("play_time")))
+        # 主模式（user.playmode）用于在模式选择处标注
+        self.main_mode = user.get("playmode") or None
+        self._refresh_mode_labels()
         if avatar_bytes:
             self._set_avatar(avatar_bytes)
         self._save_config()  # 令牌可能已被自动刷新
@@ -1203,8 +1291,20 @@ class App:
         self.avatar_img = None
         for key in self.stat_labels:
             self.stat_labels[key].config(text="—")
+        self.main_mode = None
+        self._refresh_mode_labels()
 
-    # ---------- 模式 / 刷新 ----------
+    # ---------- 模式标签 / 刷新 ----------
+    def _mode_label(self, mode):
+        """模式按钮文字：是该玩家的主模式时追加「（主模式）」。"""
+        label = MODE_UI_NAMES[mode]
+        if self.main_mode == mode:
+            return "%s（主模式）" % label
+        return label
+
+    def _refresh_mode_labels(self):
+        for mode, button in getattr(self, "mode_buttons", {}).items():
+            button.config(text=self._mode_label(mode))
     def _on_mode_changed(self):
         self.refresh_user()
 
@@ -1267,12 +1367,17 @@ class App:
             return
         mode = self.current_mode.get()
         limit = self._fetch_limits_for(mode)["recent"]
+        output_mode, output_path = self._prepare_score_output(
+            "Recent", None if limit <= 1 else 1, None if limit <= 1 else limit)
+        if output_mode is None:
+            return
         self._set_status("正在获取最近游玩（%d 条）…" % limit)
         self._background(
             lambda: self._fetch_scores(
                 account, mode, lambda: self.api.get_recent_scores(account, mode, limit=limit)),
             lambda scores: self._apply_scores(
-                scores, mode, limit, "最近游玩", empty_msg="最近 24 小时内该模式暂无成绩"),
+                scores, mode, limit, "最近游玩", empty_msg="最近 24 小时内该模式暂无成绩",
+                output_mode=output_mode, output_path=output_path),
             error_msg="获取最近游玩失败",
         )
 
@@ -1282,28 +1387,76 @@ class App:
             return
         mode = self.current_mode.get()
         limit = self._fetch_limits_for(mode)["best"]
+        output_mode, output_path = self._prepare_score_output(
+            "Bestplay", None if limit <= 1 else 1, None if limit <= 1 else limit)
+        if output_mode is None:
+            return
         self._set_status("正在获取最佳成绩（%d 条）…" % limit)
         self._background(
             lambda: self._fetch_scores(
                 account, mode, lambda: self.api.get_best_scores(account, mode, limit=limit)),
             lambda scores: self._apply_scores(
-                scores, mode, limit, "最佳成绩", empty_msg="该模式暂无最佳成绩记录"),
+                scores, mode, limit, "最佳成绩", empty_msg="该模式暂无最佳成绩记录",
+                output_mode=output_mode, output_path=output_path),
             error_msg="获取最佳成绩失败",
         )
 
-    def _apply_scores(self, scores, mode, requested, label, empty_msg="暂无成绩"):
-        """格式化并复制成绩；结果多于 1 条时带序号，取不满时在状态栏说明。"""
+    def _apply_scores(self, scores, mode, requested, label, empty_msg="暂无成绩",
+                      output_mode="clipboard", output_path=None):
+        """格式化并输出成绩：按设置写入剪贴板或 txt 文件；多条时带序号。"""
         self._save_config()
         if not scores:
             self._set_status(empty_msg)
             return
         text = format_scores_text(scores, indexed=len(scores) > 1, display=self._display_for(mode))
-        self._copy_text(text)
         got = len(scores)
-        if requested and got < requested:
+        short = bool(requested) and got < requested
+        if output_mode == "txt" and output_path:
+            try:
+                with open(output_path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+            except OSError as exc:
+                self._show_error("写入成绩 txt 失败", exc)
+                return
+            detail = "（请求 %d 条，实际 %d 条）" % (requested, got) if short else "（%d 条）" % got
+            self._set_status("已保存%s%s 到 txt：%s" % (label, detail, output_path))
+            return
+        self._copy_text(text)
+        if short:
             self._set_status("已复制%s（请求 %d 条，实际 %d 条）到剪贴板" % (label, requested, got))
         else:
             self._set_status("已复制%s（%d 条）到剪贴板" % (label, got))
+
+    # ---------- 输出方式与成绩保存位置 ----------
+    def _prepare_score_output(self, prefix, start=None, end=None, override=None):
+        """按输出方式准备成绩输出，返回 (output_mode, path)；被阻止时返回 (None, None)。"""
+        output_mode = normalize_output_mode(override or self.config.get("output_mode"))
+        if output_mode != "txt":
+            return "clipboard", None
+        score_dir = self._resolve_score_dir()
+        if score_dir is None:
+            return None, None
+        path = os.path.join(score_dir, score_output_filename(prefix, start, end))
+        if os.path.exists(path):
+            self._set_status("获取间隔过短")
+            messagebox.showwarning("提示", "获取间隔过短", parent=self.root)
+            return None, None
+        return "txt", path
+
+    def _resolve_score_dir(self):
+        """检查成绩 txt 保存位置；未设置时提示并直接打开「获取与输出设置」。"""
+        score_dir = normalize_dir(self.config.get("score_dir"))
+        if not score_dir:
+            self._set_status("请设置成绩保存路径后获取成绩")
+            messagebox.showwarning("提示", "请设置成绩保存路径后获取成绩", parent=self.root)
+            self.on_fetch_settings()
+            return None
+        if not os.path.isdir(score_dir):
+            msg = "成绩保存位置不存在：%s" % score_dir
+            self._set_status(msg)
+            messagebox.showerror("错误", msg, parent=self.root)
+            return None
+        return score_dir
 
     # ---------- 指令 ----------
     def _show_command_error(self, msg):
@@ -1313,7 +1466,7 @@ class App:
     def on_run_command(self):
         text = self.command_var.get() if hasattr(self, "command_var") else ""
         try:
-            spec, args = parse_command(text)
+            spec, args, override = parse_command(text)
         except CommandError as exc:
             self._show_command_error(exc)
             return
@@ -1332,6 +1485,17 @@ class App:
             return
         mode = self.current_mode.get()
         kind = spec["kind"]
+        prefix = "Recent" if kind == "recent" else "Bestplay"
+        # txt 文件名区间：无参数 -> 仅前缀；1 个参数 -> 1-a；2 个参数 -> a-b
+        if not args:
+            start, end = None, None
+        elif len(args) == 1:
+            start, end = 1, args[0]
+        else:
+            start, end = args[0], args[1]
+        output_mode, output_path = self._prepare_score_output(prefix, start, end, override)
+        if output_mode is None:
+            return
         if kind == "recent":
             empty_msg = "最近 24 小时内该模式暂无成绩"
             fetch = lambda: self.api.get_recent_scores(account, mode, limit=limit, offset=offset)
@@ -1341,7 +1505,9 @@ class App:
         self._set_status("正在获取成绩（%s，从第 %d 条起共 %d 条）…" % (spec["name"], offset + 1, limit))
         self._background(
             lambda: self._fetch_scores(account, mode, fetch),
-            lambda scores: self._apply_scores(scores, mode, limit, "指令成绩", empty_msg=empty_msg),
+            lambda scores: self._apply_scores(
+                scores, mode, limit, "指令成绩", empty_msg=empty_msg,
+                output_mode=output_mode, output_path=output_path),
             error_msg="获取成绩失败",
         )
 
@@ -1472,9 +1638,11 @@ class App:
             section = self.config["fetch"]
         return section[mode]
 
-    def _apply_fetch_settings(self, fetch, image_dir=None):
+    def _apply_fetch_settings(self, fetch, score_dir=None, image_dir=None, output_mode=None):
         self.config["fetch"] = normalize_fetch_section(fetch)
-        self.config["image_dir"] = normalize_image_dir(image_dir)
+        self.config["score_dir"] = normalize_dir(score_dir)
+        self.config["image_dir"] = normalize_dir(image_dir)
+        self.config["output_mode"] = normalize_output_mode(output_mode)
         self._save_config()
         self._set_status("获取与输出设置已保存（按模式分别生效）")
 
@@ -1482,13 +1650,15 @@ class App:
         dialog = FetchSettingsDialog(
             self.root, self.config.get("fetch"), self._apply_fetch_settings,
             image_dir=self.config.get("image_dir"),
+            score_dir=self.config.get("score_dir"),
+            output_mode=self.config.get("output_mode"),
         )
         self.root.wait_window(dialog.window)
 
     # ---------- 谱面背景图 ----------
     def _resolve_image_dir(self):
         """检查图片保存位置；未设置时提示并直接打开「获取与输出设置」。"""
-        image_dir = normalize_image_dir(self.config.get("image_dir"))
+        image_dir = normalize_dir(self.config.get("image_dir"))
         if not image_dir:
             self._set_status("请设置下载路径后获取背景图")
             messagebox.showwarning("提示", "请设置下载路径后获取背景图", parent=self.root)
