@@ -23,6 +23,9 @@ MODE_NAMES = {
 }
 MODES = list(MODE_NAMES.keys())
 
+# API v2 ruleset_id -> 模式名（用于谱面属性计算等）
+RULESET_IDS = {0: "osu", 1: "taiko", 2: "fruits", 3: "mania"}
+
 
 class OsuApiError(Exception):
     """携带 HTTP 状态码的 API 错误。code 为 0 表示网络类错误。"""
@@ -34,19 +37,24 @@ class OsuApiError(Exception):
 
 
 class OsuApi:
-    def __init__(self, client_id, client_secret, redirect_uri):
+    def __init__(self, client_id, client_secret, redirect_uri, on_token_refresh=None):
         self.client_id = client_id
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
+        # 刷新令牌成功后的回调（用于把轮换后的 refresh_token 落盘，避免丢失）
+        self.on_token_refresh = on_token_refresh
 
     # ---------- HTTP 基础 ----------
     @staticmethod
-    def _request_json(url, data=None, access_token=None, timeout=30):
+    def _request_json(url, data=None, access_token=None, timeout=30, api_version="20220705"):
         headers = {"Accept": "application/json"}
+        if data is None and api_version:
+            headers["x-api-version"] = api_version
         if access_token:
             headers["Authorization"] = "Bearer " + access_token
         if data is not None:
-            body = urllib.parse.urlencode(data).encode("utf-8")
+            # doseq=True：列表参数展开为重复键（如 mods[]=DT&mods[]=HD）
+            body = urllib.parse.urlencode(data, doseq=True).encode("utf-8")
             headers["Content-Type"] = "application/x-www-form-urlencoded"
             req = urllib.request.Request(url, data=body, headers=headers)
         else:
@@ -103,20 +111,30 @@ class OsuApi:
         if resp.get("refresh_token"):
             account["refresh_token"] = resp["refresh_token"]
         account["expires_at"] = time.time() + int(resp.get("expires_in", 86400))
+        if self.on_token_refresh:
+            try:
+                self.on_token_refresh(account)
+            except Exception:
+                pass
 
-    def _call(self, path, account, params=None):
+    def _call(self, path, account, params=None, method="GET"):
         self._ensure_token(account)
         url = API_BASE + path
+        data = None
+        if method == "POST":
+            data = params
+            params = None
         if params:
-            url += "?" + urllib.parse.urlencode(params)
+            # doseq=True：列表参数展开为重复键（如 mods[]=DT&mods[]=HD）
+            url += "?" + urllib.parse.urlencode(params, doseq=True)
         try:
-            return self._request_json(url, access_token=account["access_token"])
+            return self._request_json(url, data=data, access_token=account["access_token"])
         except OsuApiError as exc:
             if exc.code == 401:
                 # 强制刷新后重试一次
                 account["expires_at"] = 0
                 self._ensure_token(account)
-                return self._request_json(url, access_token=account["access_token"])
+                return self._request_json(url, data=data, access_token=account["access_token"])
             raise
 
     # ---------- 业务接口 ----------
@@ -126,16 +144,45 @@ class OsuApi:
     def get_user(self, account, mode):
         return self._call("/users/%s" % account["user_id"], account, {"mode": mode})
 
-    def get_recent_scores(self, account, mode, limit=1):
+    def get_recent_scores(self, account, mode, limit=1, offset=0):
+        # 默认同时返回 stable(legacy) 与 lazer(solo) 成绩；来源可通过成绩的 best_id 区分
+        # 注意：最近成绩仅包含最近 24 小时，且 offset + limit 不能超过 100
+        params = {"mode": mode, "limit": limit}
+        if offset:
+            params["offset"] = offset
         return self._call(
             "/users/%s/scores/recent" % account["user_id"],
             account,
-            {"mode": mode, "limit": limit},
+            params,
         )
 
-    def get_best_scores(self, account, mode, limit=100):
+    def get_best_scores(self, account, mode, limit=100, offset=0):
+        # 默认同时返回 stable(legacy) 与 lazer(solo) 成绩；来源可通过成绩的 best_id 区分
+        params = {"mode": mode, "limit": limit}
+        if offset:
+            params["offset"] = offset
         return self._call(
             "/users/%s/scores/best" % account["user_id"],
             account,
-            {"mode": mode, "limit": limit},
+            params,
         )
+
+    def get_beatmap_attributes(self, account, beatmap_id, mods, ruleset=None):
+        """获取指定谱面在给定模组下的难度属性，返回带模组星数（star_rating）。
+
+        mods 为模组缩写列表（如 ["DT", "HD"]）；ruleset 可选（osu/taiko/fruits/mania），
+        用于转换谱面时按实际游玩模式计算。mods 参数按 API 要求以 mods[]= 数组形式提交。
+        """
+        params = {"mods[]": mods}
+        if ruleset:
+            params["ruleset"] = ruleset
+        # 该接口是 POST（routes/web.php: Route::post('beatmaps/{beatmap}/attributes', ...)）
+        resp = self._call(
+            "/beatmaps/%s/attributes" % beatmap_id,
+            account,
+            params,
+            method="POST",
+        )
+        attributes = resp.get("attributes") or {}
+        stars = attributes.get("star_rating")
+        return stars if isinstance(stars, (int, float)) else None
