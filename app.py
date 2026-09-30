@@ -73,6 +73,10 @@ BEATMAP_STATUS_LABELS = {
 }
 ACC_STYLE_LABELS = {"percent": "默认（两位小数+%）", "plain": "省略百分号", "digits4": "四位数"}
 PP_STYLE_LABELS = {"int": "默认（取整）", "precise": "精确（两位小数）"}
+STAR_STYLE_LABELS = {"default": "默认（4.76★）", "asterisk": "星号显示（4.76*）", "none": "省略★（4.76）"}
+
+# DT/NC/HT 的默认倍速（lazer 中可自定义倍速）
+_RATE_MOD_DEFAULT_SPEED = {"DT": 1.5, "NC": 1.5, "HT": 0.75}
 
 # 成绩获取默认数量：按模式分别保存（recent = 最近成绩条数，best = 最佳成绩条数）
 FETCH_LIMIT_MAX = 100
@@ -90,6 +94,10 @@ def default_fetch_settings():
 OUTPUT_MODES = ("clipboard", "txt")
 OUTPUT_MODE_LABELS = {"clipboard": "输出至剪贴板", "txt": "输出至 txt 文件"}
 OUTPUT_MODE_SUFFIX = {"-copy": "clipboard", "-txt": "txt"}
+# 模式后缀：指令末尾 (osu)/(taiko)/(catch)/(mania) -> 内部模式 key
+MODE_SUFFIX = {"(osu)": "osu", "(taiko)": "taiko", "(catch)": "fruits", "(mania)": "mania"}
+# 内部模式 key -> 文件名里的模式短写法（osu/taiko/catch/mania）
+MODE_SHORT_NAMES = {"osu": "osu", "taiko": "taiko", "fruits": "catch", "mania": "mania"}
 
 
 def normalize_output_mode(value):
@@ -102,12 +110,26 @@ def normalize_dir(value):
     return value.strip() if isinstance(value, str) else ""
 
 
-def score_output_filename(prefix, start=None, end=None, now=None):
-    """成绩 txt 文件名：Bestplay / Recent + [起-止] + 时间（精确到分钟）。"""
+def score_output_filename(prefix, start=None, end=None, now=None, mode=None):
+    """成绩 txt 文件名：前缀 + [模式] + [起-止] + 时间（精确到分钟）。
+
+    mode 为模式的短写法（osu/taiko/catch/mania）；为 None 时省略模式段
+    （主界面按钮路径不传 mode，保持原有文件名不变）。
+    """
     stamp = time.strftime("%Y-%m-%d %H-%M", time.localtime(time.time() if now is None else now))
-    if start is None or end is None:
-        return "%s %s.txt" % (prefix, stamp)
-    return "%s %d-%d %s.txt" % (prefix, start, end, stamp)
+    parts = [prefix]
+    if mode:
+        parts.append(mode)
+    if start is not None and end is not None:
+        parts.append("%d-%d" % (start, end))
+    parts.append(stamp)
+    return " ".join(parts) + ".txt"
+
+
+def user_profile_filename(username, mode, now=None):
+    """玩家资料 txt 文件名：玩家名 profile 模式 时间（精确到分钟）。"""
+    stamp = time.strftime("%Y-%m-%d %H-%M", time.localtime(time.time() if now is None else now))
+    return "%s profile %s %s.txt" % (username, MODE_SHORT_NAMES.get(mode, mode), stamp)
 
 
 def _normalize_limit(value, default):
@@ -147,6 +169,8 @@ def normalize_config(config):
     config["image_dir"] = normalize_dir(config.get("image_dir"))
     config["score_dir"] = normalize_dir(config.get("score_dir"))
     config["output_mode"] = normalize_output_mode(config.get("output_mode"))
+    config["use_unified_dir"] = _as_bool(config.get("use_unified_dir"), False)
+    config["unified_dir"] = normalize_dir(config.get("unified_dir"))
     return config
 
 
@@ -168,7 +192,7 @@ COMMAND_SPECS = [
             ("/r", "获取最新的 1 个成绩"),
             ("/r a", "获取最近的 a 个成绩（1 ≤ a ≤ 100）"),
             ("/r a b", "获取最近第 a 到第 b 个成绩（a < b，数量 ≤ 100）"),
-            ("/r <形式> -copy|-txt", "在末尾指定本次输出方式：-copy 剪贴板，-txt txt 文件"),
+            ("/r <形式> [(osu|taiko|catch|mania)] [-copy|-txt]", "末尾可加模式后缀与输出方式后缀，各最多一个；模式后缀指定取数模式（缺省用主界面模式）"),
         ],
     },
     {
@@ -191,7 +215,31 @@ COMMAND_SPECS = [
             ("/bp", "获取单曲 pp 最高的 1 个成绩"),
             ("/bp a", "获取单曲 pp 最高的 a 个成绩（1 ≤ a ≤ 100）"),
             ("/bp a b", "获取第 a 高到第 b 高的成绩（a < b，数量 ≤ 100）"),
-            ("/bp <形式> -copy|-txt", "在末尾指定本次输出方式：-copy 剪贴板，-txt txt 文件"),
+            ("/bp <形式> [(osu|taiko|catch|mania)] [-copy|-txt]", "末尾可加模式后缀与输出方式后缀，各最多一个；模式后缀指定取数模式（缺省用主界面模式）"),
+        ],
+    },
+    {
+        "name": "/show",
+        "kind": "show",
+        "arg_mode": "user_lookup",
+        "min_args": 2,
+        "max_args": None,
+        "forms": [
+            ("/show name 玩家名", "以弹窗显示指定玩家名的玩家信息"),
+            ("/show id 玩家ID", "以弹窗显示指定ID的玩家信息"),
+        ],
+    },
+    {
+        "name": "/user",
+        "kind": "user",
+        "arg_mode": "user",
+        "min_args": 3,
+        "max_args": None,
+        "forms": [
+            ("/user find name 玩家名", "通过玩家名查找ID（弹窗显示并复制到剪贴板）"),
+            ("/user find id 玩家ID", "通过ID查找玩家名（弹窗显示并复制到剪贴板）"),
+            ("/user avatar name|id 玩家名/玩家ID", "下载玩家头像到图片保存路径"),
+            ("/user profile name|id 玩家名/玩家ID [-copy|-txt]", "输出玩家信息到剪贴板/txt"),
         ],
     },
 ]
@@ -199,12 +247,14 @@ COMMAND_SPECS = [
 COMMAND_RULES = [
     "参数必须是正整数（≥ 1）；两个参数时必须 a < b。",
     "一次最多获取 %d 条成绩。" % FETCH_LIMIT_MAX,
-    "指令作用于当前选中的模式。",
+    "模式后缀 (osu)(taiko)(catch)(mania) 可指定取数模式；缺省使用主界面当前模式。",
     "最近成绩受 osu! API 限制：只包含最近 24 小时内、且最多取到第 100 个。",
     "取成绩指令（/r、/bp）默认使用「获取与输出设置」里的成绩默认输出方式，",
-    "可在末尾加 -copy 或 -txt 覆盖本次输出方式，例如 /bp 1 5 -txt。",
+    "输出方式后缀 -copy / -txt 可覆盖本次输出；两种后缀各最多一个、顺序不限，例如 /r 2 6 (mania) -copy。",
     "输出 txt 需要先设置「成绩信息 txt」保存位置；同一分钟内生成同名文件会提示「获取间隔过短」。",
     "获取背景图前需先在「获取与输出设置」里设置图片保存位置。",
+    "玩家名可含空格；按 ID 查询时 ID 必须是正整数。",
+    "/user profile 支持 -copy / -txt 后缀；/show 与 /user find/avatar 不支持。",
 ]
 
 
@@ -226,9 +276,11 @@ def find_command_spec(name):
 
 
 def parse_command(text):
-    """解析指令文本，返回 (spec, args, output_override)；出错抛出 CommandError。
+    """解析指令文本，返回 (spec, args, output_override, mode_override)；出错抛出 CommandError。
 
-    /r、/bp 允许在末尾追加 -copy / -txt，指定本次输出方式（覆盖默认输出方式）。
+    /r、/bp 允许在数字参数之后追加两类后缀（各最多一个，顺序不限）：
+      - 输出方式后缀：-copy / -txt，覆盖本次输出方式；
+      - 模式后缀：(osu) / (taiko) / (catch) / (mania)，指定取数模式（缺省用主界面当前模式）。
     """
     tokens = (text or "").split()
     if not tokens:
@@ -239,12 +291,25 @@ def parse_command(text):
             tokens[0], "、".join(item["name"] for item in COMMAND_SPECS)))
     raw_args = tokens[1:]
     output_override = None
-    if raw_args and spec["kind"] in ("recent", "best"):
-        suffix = raw_args[-1].lower()
-        if suffix in OUTPUT_MODE_SUFFIX:
-            output_override = OUTPUT_MODE_SUFFIX[suffix]
-            raw_args = raw_args[:-1]
-    if not (spec["min_args"] <= len(raw_args) <= spec["max_args"]):
+    mode_override = None
+    if spec["kind"] in ("recent", "best"):
+        # 从末尾依次剥离后缀；同一种后缀最多一个
+        while raw_args:
+            last = raw_args[-1].lower()
+            if last in OUTPUT_MODE_SUFFIX:
+                if output_override is not None:
+                    raise CommandError("输出方式后缀只能出现一次：%s" % raw_args[-1])
+                output_override = OUTPUT_MODE_SUFFIX[last]
+                raw_args = raw_args[:-1]
+                continue
+            if last in MODE_SUFFIX:
+                if mode_override is not None:
+                    raise CommandError("模式后缀只能出现一次：%s" % raw_args[-1])
+                mode_override = MODE_SUFFIX[last]
+                raw_args = raw_args[:-1]
+                continue
+            break
+    if len(raw_args) < spec["min_args"] or (spec["max_args"] is not None and len(raw_args) > spec["max_args"]):
         raise CommandError("指令 %s 的参数个数不正确。\n可用形式：\n%s" % (
             spec["name"], "\n".join("    " + form + "    " + desc for form, desc in spec["forms"])))
     if spec.get("arg_mode") == "background":
@@ -258,9 +323,41 @@ def parse_command(text):
             raise CommandError("谱面编号必须是正整数：%s" % number_raw)
         if beatmap_id < 1:
             raise CommandError("谱面编号必须是正整数：%s" % number_raw)
-        return spec, [kind_raw, beatmap_id], output_override
+        return spec, [kind_raw, beatmap_id], None, None
+    if spec.get("arg_mode") == "user_lookup":
+        # /show name|id 玩家名/玩家ID
+        typ = raw_args[0].lower()
+        if typ not in ("name", "id"):
+            raise CommandError("/show 的查找方式必须是 name 或 id（例如 /show name 玩家名）。")
+        value = " ".join(raw_args[1:]).strip()
+        if not value:
+            raise CommandError("请填写玩家名或玩家ID。")
+        if typ == "id" and not value.isdigit():
+            raise CommandError("玩家ID必须是正整数：%s" % value)
+        return spec, [typ, value], None, None
+    if spec.get("arg_mode") == "user":
+        # /user find|avatar|profile name|id 玩家名/玩家ID [-copy|-txt]
+        sub = raw_args[0].lower()
+        if sub not in ("find", "avatar", "profile"):
+            raise CommandError("/user 的子指令必须是 find、avatar 或 profile。")
+        typ = raw_args[1].lower()
+        if typ not in ("name", "id"):
+            raise CommandError("/user 的查找方式必须是 name 或 id。")
+        rest = raw_args[2:]
+        if sub == "profile" and rest and rest[-1].lower() in OUTPUT_MODE_SUFFIX:
+            output_override = OUTPUT_MODE_SUFFIX[rest[-1].lower()]
+            rest = rest[:-1]
+        value = " ".join(rest).strip()
+        if not value:
+            raise CommandError("请填写玩家名或玩家ID。")
+        if typ == "id" and not value.isdigit():
+            raise CommandError("玩家ID必须是正整数：%s" % value)
+        return spec, [sub, typ, value], output_override, None
     args = []
     for raw in raw_args:
+        stripped = raw.strip().lower()
+        if stripped.startswith("(") and stripped.endswith(")"):
+            raise CommandError("未知的模式后缀：%s（可用：osu / taiko / catch / mania）" % raw)
         try:
             value = int(raw)
         except ValueError:
@@ -268,7 +365,7 @@ def parse_command(text):
         if value < 1:
             raise CommandError("参数必须是正整数：%s" % raw)
         args.append(value)
-    return spec, args, output_override
+    return spec, args, output_override, mode_override
 
 
 def resolve_range(spec, args):
@@ -313,6 +410,7 @@ def default_display_settings():
         "separate_client": True,
         "acc_style": "percent",
         "pp_style": "int",
+        "star_style": "default",
     }
 
 
@@ -357,6 +455,9 @@ def normalize_display_settings(raw):
     pp_style = raw.get("pp_style")
     if pp_style not in PP_STYLE_LABELS:
         pp_style = defaults["pp_style"]
+    star_style = raw.get("star_style")
+    if star_style not in STAR_STYLE_LABELS:
+        star_style = defaults["star_style"]
 
     # 旧版把「游玩平台」当作一个字段：曾隐藏它的用户相当于「不单独显示平台」
     separate_default = True
@@ -373,6 +474,7 @@ def normalize_display_settings(raw):
         "separate_client": _as_bool(raw.get("separate_client"), separate_default),
         "acc_style": acc_style,
         "pp_style": pp_style,
+        "star_style": star_style,
     }
 
 
@@ -480,18 +582,52 @@ def score_client(score):
     return "lazer"
 
 
-def format_mods(score):
-    """把 mods 字段格式化为缩写字符串（兼容 stable 的字符串数组与 lazer 的对象数组）。
+def _mod_acronym_and_speed(mod):
+    """返回 (缩写, 倍速)。仅 DT/NC/HT 会带倍速；无 settings 时按默认倍速返回。"""
+    if isinstance(mod, dict):
+        acronym = mod.get("acronym") or ""
+    else:
+        acronym = str(mod)
+    if acronym in _RATE_MOD_DEFAULT_SPEED:
+        settings = mod.get("settings") if isinstance(mod, dict) else None
+        speed = settings.get("speed_change") if isinstance(settings, dict) else None
+        if speed is None:
+            speed = _RATE_MOD_DEFAULT_SPEED[acronym]
+        return acronym, speed
+    return acronym, None
 
-    lazer 成绩中 mods 是形如 {"acronym": "HD", "settings": {...}} 的对象数组。
+
+def score_has_custom_rate(score):
+    """成绩是否包含自定义倍速的 DT/NC/HT（倍速与默认不同）。"""
+    for mod in score.get("mods") or []:
+        acronym, speed = _mod_acronym_and_speed(mod)
+        if acronym in _RATE_MOD_DEFAULT_SPEED and abs(speed - _RATE_MOD_DEFAULT_SPEED[acronym]) > 1e-9:
+            return True
+    return False
+
+
+def star_suffix(style="default"):
+    """星数后缀：default -> ★，asterisk -> *，none -> 空。"""
+    if style == "asterisk":
+        return "*"
+    if style == "none":
+        return ""
+    return "★"
+
+
+def format_mods(score):
+    """把 mods 格式化为缩写字符串（兼容 stable 字符串数组与 lazer 对象数组）。
+
+    多个模组用 + 连接；自定义倍速的 DT/NC/HT 会带倍速（如 1.2DT、0.95HT）。
     """
     parts = []
     for mod in score.get("mods") or []:
-        if isinstance(mod, dict):
-            parts.append(mod.get("acronym") or "")
+        acronym, speed = _mod_acronym_and_speed(mod)
+        if acronym in _RATE_MOD_DEFAULT_SPEED and abs(speed - _RATE_MOD_DEFAULT_SPEED[acronym]) > 1e-9:
+            parts.append("%g%s" % (speed, acronym))
         else:
-            parts.append(str(mod))
-    return "".join(parts) or "NM"
+            parts.append(acronym)
+    return "+".join(parts) or "NM"
 
 
 def format_acc(score, style="percent"):
@@ -576,7 +712,9 @@ def render_field(field, score, display):
         stars = score.get("_mod_star_rating")
         if stars is None:
             stars = beatmap.get("difficulty_rating")
-        return ["%.2f★" % stars] if isinstance(stars, (int, float)) else ["?"]
+        if not isinstance(stars, (int, float)):
+            return ["?"]
+        return ["%.2f%s" % (stars, star_suffix(display.get("star_style", "default")))]
     if field == "mods":
         return [format_mods(score)]
     if field == "score":
@@ -613,6 +751,36 @@ def format_scores_text(scores, indexed=False, display=None):
     lines = []
     for i, score in enumerate(scores, start=1):
         lines.append(format_score_line(score, i if indexed else None, display=display))
+    return "\n".join(lines)
+
+
+def format_user_profile(user, scores, mode, display=None):
+    """格式化任意玩家的「玩家信息」文本：基本信息 + 前 5 个最佳成绩。"""
+    stats = user.get("statistics") or {}
+    pp = stats.get("pp")
+    acc = stats.get("hit_accuracy")
+    play_count = stats.get("play_count")
+    country_rank = stats.get("country_rank")
+    global_rank = stats.get("global_rank")
+
+    lines = [
+        "玩家名：%s" % (user.get("username") or "?"),
+        "用户ID：%s" % (user.get("id") or "?"),
+        "模式：%s" % MODE_UI_NAMES.get(mode, str(mode)),
+        "PP：%s" % ("N/A" if pp is None else pp),
+        "ACC：%s" % ("N/A" if acc is None else "%.2f%%" % acc),
+        "游玩时长：%s" % format_duration(stats.get("play_time")),
+        "游玩次数：%s" % ("N/A" if play_count is None else play_count),
+        "地区：%s" % country_name(user.get("country_code")),
+        "地区排名：%s" % ("未上榜" if country_rank is None else "#%s" % country_rank),
+        "全球排名：%s" % ("未上榜" if global_rank is None else "#%s" % global_rank),
+        "",
+        "最佳成绩（前 5）：",
+    ]
+    if scores:
+        lines.append(format_scores_text(scores, indexed=True, display=display))
+    else:
+        lines.append("（暂无）")
     return "\n".join(lines)
 
 
@@ -725,6 +893,7 @@ class DisplaySettingsDialog:
         self.miss_var = tk.BooleanVar()
         self.acc_var = tk.StringVar()
         self.pp_var = tk.StringVar()
+        self.star_var = tk.StringVar()
         self.field_vars = {fid: tk.BooleanVar() for fid in FIELD_IDS}
 
         self._build()
@@ -789,6 +958,12 @@ class DisplaySettingsDialog:
         for i, style in enumerate(PP_STYLE_LABELS):
             ttk.Radiobutton(pp_box, text=PP_STYLE_LABELS[style], value=style,
                             variable=self.pp_var, command=self._touch).grid(row=0, column=i, padx=(0, 10))
+        ttk.Label(opts, text="星数显示方式：").grid(row=7, column=0, sticky="e", pady=(4, 0))
+        star_box = ttk.Frame(opts)
+        star_box.grid(row=7, column=1, sticky="w", pady=(4, 0))
+        for i, style in enumerate(STAR_STYLE_LABELS):
+            ttk.Radiobutton(star_box, text=STAR_STYLE_LABELS[style], value=style,
+                            variable=self.star_var, command=self._touch).grid(row=0, column=i, padx=(0, 10))
 
         preview_frame = ttk.LabelFrame(right, text=" 预览 ", padding=8)
         preview_frame.pack(fill="both", expand=True, pady=(8, 0))
@@ -833,6 +1008,7 @@ class DisplaySettingsDialog:
         settings["separate_client"] = bool(self.separate_client_var.get())
         settings["acc_style"] = self.acc_var.get()
         settings["pp_style"] = self.pp_var.get()
+        settings["star_style"] = self.star_var.get()
         settings["hidden"] = [fid for fid in settings["fields"]
                               if fid != "title" and not self.field_vars[fid].get()]
 
@@ -865,6 +1041,7 @@ class DisplaySettingsDialog:
         self.separate_client_var.set(bool(settings.get("separate_client", True)))
         self.acc_var.set(settings["acc_style"])
         self.pp_var.set(settings["pp_style"])
+        self.star_var.set(settings["star_style"])
         self._rebuild_rows()
         self._update_preview()
 
@@ -892,12 +1069,15 @@ class DisplaySettingsDialog:
 class FetchSettingsDialog:
     """「获取与输出设置」弹窗：成绩获取数量、默认输出方式与保存位置。"""
 
-    def __init__(self, parent, fetch_config, on_save, image_dir="", score_dir="", output_mode="clipboard"):
+    def __init__(self, parent, fetch_config, on_save, image_dir="", score_dir="", output_mode="clipboard",
+                 use_unified_dir=False, unified_dir=""):
         self.on_save = on_save
         self.draft = normalize_fetch_section(fetch_config)
         self.image_dir = normalize_dir(image_dir)
         self.score_dir = normalize_dir(score_dir)
         self.output_mode = normalize_output_mode(output_mode)
+        self.use_unified_dir = _as_bool(use_unified_dir, False)
+        self.unified_dir = normalize_dir(unified_dir)
         self.vars = {}  # (mode, kind) -> StringVar
 
         self.window = tk.Toplevel(parent)
@@ -941,17 +1121,35 @@ class FetchSettingsDialog:
         loc_frame.pack(fill="x", pady=(10, 0))
         loc_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(loc_frame, text="成绩信息 txt：").grid(row=0, column=0, sticky="w", pady=4)
-        self.score_dir_var = tk.StringVar()
-        ttk.Entry(loc_frame, textvariable=self.score_dir_var).grid(row=0, column=1, sticky="ew", padx=6)
-        ttk.Button(loc_frame, text="选择文件夹…",
-                   command=lambda: self._choose_dir(self.score_dir_var)).grid(row=0, column=2)
+        self.use_unified_var = tk.BooleanVar(value=self.use_unified_dir)
+        ttk.Checkbutton(loc_frame, text="统一位置（背景图与成绩 txt 保存到同一路径）",
+                        variable=self.use_unified_var, command=self._toggle_unified).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
 
-        ttk.Label(loc_frame, text="背景图片：").grid(row=1, column=0, sticky="w", pady=4)
+        self.unified_row = ttk.Frame(loc_frame)
+        self.unified_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=2)
+        ttk.Label(self.unified_row, text="统一保存路径：").pack(side="left")
+        self.unified_dir_var = tk.StringVar()
+        ttk.Entry(self.unified_row, textvariable=self.unified_dir_var).pack(
+            side="left", fill="x", expand=True, padx=6)
+        ttk.Button(self.unified_row, text="选择文件夹…",
+                   command=lambda: self._choose_dir(self.unified_dir_var)).pack(side="left")
+
+        ttk.Label(loc_frame, text="成绩信息 txt：").grid(row=2, column=0, sticky="w", pady=4)
+        self.score_dir_var = tk.StringVar()
+        self.score_entry = ttk.Entry(loc_frame, textvariable=self.score_dir_var)
+        self.score_entry.grid(row=2, column=1, sticky="ew", padx=6)
+        self.score_button = ttk.Button(loc_frame, text="选择文件夹…",
+                                       command=lambda: self._choose_dir(self.score_dir_var))
+        self.score_button.grid(row=2, column=2)
+
+        ttk.Label(loc_frame, text="背景图片：").grid(row=3, column=0, sticky="w", pady=4)
         self.image_dir_var = tk.StringVar()
-        ttk.Entry(loc_frame, textvariable=self.image_dir_var).grid(row=1, column=1, sticky="ew", padx=6)
-        ttk.Button(loc_frame, text="选择文件夹…",
-                   command=lambda: self._choose_dir(self.image_dir_var)).grid(row=1, column=2)
+        self.image_entry = ttk.Entry(loc_frame, textvariable=self.image_dir_var)
+        self.image_entry.grid(row=3, column=1, sticky="ew", padx=6)
+        self.image_button = ttk.Button(loc_frame, text="选择文件夹…",
+                                       command=lambda: self._choose_dir(self.image_dir_var))
+        self.image_button.grid(row=3, column=2)
 
         ttk.Label(body, text="保存位置可留空；获取时若需要而未设置，会提示设置。",
                   foreground="#666").pack(anchor="w", pady=(6, 0))
@@ -970,6 +1168,9 @@ class FetchSettingsDialog:
         self.output_mode_var.set(self.output_mode)
         self.score_dir_var.set(self.score_dir)
         self.image_dir_var.set(self.image_dir)
+        self.use_unified_var.set(self.use_unified_dir)
+        self.unified_dir_var.set(self.unified_dir)
+        self._toggle_unified()
 
     def _reset(self):
         defaults = default_fetch_settings()
@@ -978,6 +1179,9 @@ class FetchSettingsDialog:
         self.output_mode_var.set(OUTPUT_MODES[0])
         self.score_dir_var.set("")
         self.image_dir_var.set("")
+        self.use_unified_var.set(False)
+        self.unified_dir_var.set("")
+        self._toggle_unified()
 
     def _choose_dir(self, var):
         current = (var.get() or "").strip()
@@ -985,6 +1189,16 @@ class FetchSettingsDialog:
         path = filedialog.askdirectory(parent=self.window, title="选择保存位置", initialdir=initial)
         if path:
             var.set(os.path.abspath(path))
+
+    def _toggle_unified(self):
+        if self.use_unified_var.get():
+            self.unified_row.grid()
+            for w in (self.score_entry, self.score_button, self.image_entry, self.image_button):
+                w.state(["disabled"])
+        else:
+            self.unified_row.grid_remove()
+            for w in (self.score_entry, self.score_button, self.image_entry, self.image_button):
+                w.state(["!disabled"])
 
     def _collect(self):
         result = {mode: {} for mode in MODES}
@@ -1013,12 +1227,21 @@ class FetchSettingsDialog:
     def _ok(self):
         try:
             result = self._collect()
-            score_dir = self._collect_dir(self.score_dir_var.get(), "成绩信息 txt 保存位置")
-            image_dir = self._collect_dir(self.image_dir_var.get(), "图片保存位置")
+            use_unified = bool(self.use_unified_var.get())
+            if use_unified:
+                unified_dir = self._collect_dir(self.unified_dir_var.get(), "统一保存位置")
+                if not unified_dir:
+                    raise InputError("请填写统一保存位置。")
+                score_dir = normalize_dir(self.score_dir_var.get())
+                image_dir = normalize_dir(self.image_dir_var.get())
+            else:
+                unified_dir = ""
+                score_dir = self._collect_dir(self.score_dir_var.get(), "成绩信息 txt 保存位置")
+                image_dir = self._collect_dir(self.image_dir_var.get(), "图片保存位置")
         except InputError as exc:
             messagebox.showwarning("获取与输出设置", str(exc), parent=self.window)
             return
-        self.on_save(result, score_dir, image_dir, self.output_mode_var.get())
+        self.on_save(result, score_dir, image_dir, self.output_mode_var.get(), use_unified, unified_dir)
         self.window.destroy()
 
 
@@ -1072,6 +1295,59 @@ class BackgroundDialog:
             return
         self.result = (beatmap_id, self.kind_var.get())
         self.window.destroy()
+
+
+class UserQueryDialog:
+    """「用户查询」弹窗：按名字/ID 查看信息、查找、下载头像、输出资料。"""
+
+    def __init__(self, parent, app):
+        self.app = app
+        self.window = tk.Toplevel(parent)
+        self.window.title("用户查询")
+        self.window.geometry("460x240")
+        self.window.minsize(440, 220)
+        self.window.transient(parent)
+        self.window.grab_set()
+
+        body = ttk.Frame(self.window, padding=12)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(body, text="查找方式：").grid(row=0, column=0, sticky="w", pady=6)
+        self.type_var = tk.StringVar(value="name")
+        type_box = ttk.Frame(body)
+        type_box.grid(row=0, column=1, sticky="w", pady=6)
+        ttk.Radiobutton(type_box, text="按玩家名", value="name", variable=self.type_var).grid(row=0, column=0, padx=(0, 12))
+        ttk.Radiobutton(type_box, text="按玩家ID", value="id", variable=self.type_var).grid(row=0, column=1)
+
+        ttk.Label(body, text="玩家名/ID：").grid(row=1, column=0, sticky="w", pady=6)
+        self.value_var = tk.StringVar()
+        entry = ttk.Entry(body, textvariable=self.value_var, width=24)
+        entry.grid(row=1, column=1, sticky="w", pady=6)
+        entry.focus_set()
+        entry.bind("<Return>", lambda e: self._dispatch("show"))
+
+        actions = ttk.Frame(body)
+        actions.grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Button(actions, text="查看玩家信息", command=lambda: self._dispatch("show")).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="查找", command=lambda: self._dispatch("find")).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="下载头像", command=lambda: self._dispatch("avatar")).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="输出资料", command=lambda: self._dispatch("profile")).pack(side="left")
+
+        buttons = ttk.Frame(self.window, padding=10)
+        buttons.pack(fill="x", side="bottom")
+        ttk.Button(buttons, text="关闭", command=self.window.destroy).pack(side="right", padx=4)
+
+    def _dispatch(self, action):
+        typ = self.type_var.get()
+        value = (self.value_var.get() or "").strip()
+        if not value:
+            messagebox.showwarning("用户查询", "请输入玩家名或玩家ID。", parent=self.window)
+            return
+        if typ == "id" and not value.isdigit():
+            messagebox.showwarning("用户查询", "按玩家ID查询时，ID 必须是正整数。", parent=self.window)
+            return
+        self.window.destroy()
+        self.app._run_user_action(action, typ, value)
 
 
 class App:
@@ -1170,8 +1446,13 @@ class App:
             side="left", padx=6, expand=True, fill="x")
         ttk.Button(actions, text="刷新数据", command=self.on_refresh).pack(
             side="left", padx=6, expand=True, fill="x")
-        ttk.Button(actions, text="获取背景图", command=self.on_get_background).pack(
-            side="left", padx=6, expand=True, fill="x")
+        self.more_button = ttk.Button(actions, text="更多功能", command=self.on_more_menu)
+        self.more_button.pack(side="left", padx=6, expand=True, fill="x")
+
+        # 「更多功能」下拉菜单
+        self.more_menu = tk.Menu(self.root, tearoff=0)
+        self.more_menu.add_command(label="用户查询功能", command=self.on_user_query)
+        self.more_menu.add_command(label="获取谱面背景图", command=self.on_get_background)
 
         # 指令输入
         cmd = ttk.Frame(self.root, padding=8)
@@ -1340,6 +1621,9 @@ class App:
         失败时保留基础星数。同一 (谱面, 模组) 在本次会话内只请求一次。
         """
         for score in scores:
+            if score_has_custom_rate(score):
+                # 自定义倍速：API 无法计算其星数，回退到基础星数
+                continue
             mods = self._score_mod_acronyms(score)
             if not set(mods) & STAR_RATING_MODS:
                 continue
@@ -1428,23 +1712,44 @@ class App:
             self._set_status("已复制%s（%d 条）到剪贴板" % (label, got))
 
     # ---------- 输出方式与成绩保存位置 ----------
-    def _prepare_score_output(self, prefix, start=None, end=None, override=None):
-        """按输出方式准备成绩输出，返回 (output_mode, path)；被阻止时返回 (None, None)。"""
+    def _prepare_score_output(self, prefix, start=None, end=None, override=None, mode=None):
+        """按输出方式准备成绩输出，返回 (output_mode, path)；被阻止时返回 (None, None)。
+
+        mode 为文件名里的模式短写法（osu/taiko/catch/mania）；主界面按钮不传 mode，
+        因此按钮路径的 txt 文件名保持不变。
+        """
         output_mode = normalize_output_mode(override or self.config.get("output_mode"))
         if output_mode != "txt":
             return "clipboard", None
         score_dir = self._resolve_score_dir()
         if score_dir is None:
             return None, None
-        path = os.path.join(score_dir, score_output_filename(prefix, start, end))
+        path = os.path.join(score_dir, score_output_filename(prefix, start, end, mode=mode))
         if os.path.exists(path):
             self._set_status("获取间隔过短")
             messagebox.showwarning("提示", "获取间隔过短", parent=self.root)
             return None, None
         return "txt", path
 
+    def _resolve_unified_dir(self):
+        """统一位置：勾选时返回统一保存路径；未设置或无效时报错返回 None。"""
+        d = normalize_dir(self.config.get("unified_dir"))
+        if not d:
+            self._set_status("请设置统一保存位置")
+            messagebox.showwarning("提示", "请设置统一保存位置", parent=self.root)
+            self.on_fetch_settings()
+            return None
+        if not os.path.isdir(d):
+            msg = "统一保存位置不存在：%s" % d
+            self._set_status(msg)
+            messagebox.showerror("错误", msg, parent=self.root)
+            return None
+        return d
+
     def _resolve_score_dir(self):
-        """检查成绩 txt 保存位置；未设置时提示并直接打开「获取与输出设置」。"""
+        """检查成绩 txt 保存位置；统一位置优先。"""
+        if self.config.get("use_unified_dir"):
+            return self._resolve_unified_dir()
         score_dir = normalize_dir(self.config.get("score_dir"))
         if not score_dir:
             self._set_status("请设置成绩保存路径后获取成绩")
@@ -1466,7 +1771,7 @@ class App:
     def on_run_command(self):
         text = self.command_var.get() if hasattr(self, "command_var") else ""
         try:
-            spec, args, override = parse_command(text)
+            spec, args, override, mode_override = parse_command(text)
         except CommandError as exc:
             self._show_command_error(exc)
             return
@@ -1474,6 +1779,14 @@ class App:
         if spec["kind"] == "background":
             img_kind, beatmap_id = args
             self._start_background_download(beatmap_id, img_kind)
+            return
+        if spec["kind"] == "show":
+            typ, value = args
+            self._run_user_action("show", typ, value)
+            return
+        if spec["kind"] == "user":
+            sub, typ, value = args
+            self._run_user_action(sub, typ, value, override)
             return
         try:
             offset, limit = resolve_range(spec, args)
@@ -1483,7 +1796,7 @@ class App:
         account = self._require_account()
         if not account:
             return
-        mode = self.current_mode.get()
+        mode = mode_override or self.current_mode.get()
         kind = spec["kind"]
         prefix = "Recent" if kind == "recent" else "Bestplay"
         # txt 文件名区间：无参数 -> 仅前缀；1 个参数 -> 1-a；2 个参数 -> a-b
@@ -1493,7 +1806,8 @@ class App:
             start, end = 1, args[0]
         else:
             start, end = args[0], args[1]
-        output_mode, output_path = self._prepare_score_output(prefix, start, end, override)
+        output_mode, output_path = self._prepare_score_output(
+            prefix, start, end, override, mode=MODE_SHORT_NAMES[mode])
         if output_mode is None:
             return
         if kind == "recent":
@@ -1638,11 +1952,14 @@ class App:
             section = self.config["fetch"]
         return section[mode]
 
-    def _apply_fetch_settings(self, fetch, score_dir=None, image_dir=None, output_mode=None):
+    def _apply_fetch_settings(self, fetch, score_dir=None, image_dir=None, output_mode=None,
+                              use_unified_dir=False, unified_dir=""):
         self.config["fetch"] = normalize_fetch_section(fetch)
         self.config["score_dir"] = normalize_dir(score_dir)
         self.config["image_dir"] = normalize_dir(image_dir)
         self.config["output_mode"] = normalize_output_mode(output_mode)
+        self.config["use_unified_dir"] = _as_bool(use_unified_dir, False)
+        self.config["unified_dir"] = normalize_dir(unified_dir)
         self._save_config()
         self._set_status("获取与输出设置已保存（按模式分别生效）")
 
@@ -1652,12 +1969,142 @@ class App:
             image_dir=self.config.get("image_dir"),
             score_dir=self.config.get("score_dir"),
             output_mode=self.config.get("output_mode"),
+            use_unified_dir=self.config.get("use_unified_dir"),
+            unified_dir=self.config.get("unified_dir"),
         )
         self.root.wait_window(dialog.window)
 
+    # ---------- 更多功能 / 用户查询 ----------
+    def on_more_menu(self):
+        """弹出「更多功能」下拉菜单。"""
+        x = self.more_button.winfo_rootx()
+        y = self.more_button.winfo_rooty() + self.more_button.winfo_height()
+        try:
+            self.more_menu.tk_popup(x, y)
+        finally:
+            self.more_menu.grab_release()
+
+    def on_user_query(self):
+        dialog = UserQueryDialog(self.root, self)
+        self.root.wait_window(dialog.window)
+
+    def _run_user_action(self, action, typ, value, output_override=None):
+        """用户查询动作分发：show / find / avatar / profile。"""
+        account = self._require_account()
+        if not account:
+            return
+        mode = self.current_mode.get()
+        if action == "show":
+            self._set_status("正在查询玩家信息（%s）…" % value)
+            self._background(
+                lambda: self._fetch_user_info(account, value, mode),
+                self._apply_user_show,
+                error_msg="查询玩家信息失败",
+            )
+        elif action == "find":
+            self._set_status("正在查找玩家（%s）…" % value)
+            self._background(
+                lambda: self._fetch_user_lookup(account, typ, value),
+                self._apply_user_find,
+                error_msg="查找玩家失败",
+            )
+        elif action == "avatar":
+            image_dir = self._resolve_image_dir()
+            if image_dir is None:
+                return
+            self._set_status("正在下载玩家头像（%s）…" % value)
+            self._background(
+                lambda: self._fetch_user_avatar(account, value, image_dir),
+                self._apply_user_avatar,
+                error_msg="下载头像失败",
+            )
+        elif action == "profile":
+            output_mode = normalize_output_mode(output_override or self.config.get("output_mode"))
+            save_dir = self._resolve_score_dir() if output_mode == "txt" else None
+            if output_mode == "txt" and save_dir is None:
+                return
+            self._set_status("正在获取玩家资料（%s）…" % value)
+            self._background(
+                lambda: self._fetch_user_info(account, value, mode),
+                lambda res: self._apply_user_profile(res, output_mode, save_dir),
+                error_msg="输出玩家资料失败",
+            )
+
+    def _fetch_user_lookup(self, account, typ, value):
+        """查找任意玩家，返回 (typ, user)。"""
+        user = self.api.get_user_lookup(account, value)
+        return typ, user
+
+    def _fetch_user_info(self, account, value, mode):
+        """获取任意玩家信息 + 前 5 个最佳成绩，返回 (mode, user, scores)。"""
+        user = self.api.get_user_lookup(account, value, mode)
+        scores = self.api.get_best_scores_for(account, value, mode, limit=5)
+        return mode, user, scores
+
+    def _fetch_user_avatar(self, account, value, image_dir):
+        """下载任意玩家头像，返回保存路径；已存在同名文件则报错。"""
+        user = self.api.get_user_lookup(account, value)
+        avatar_url = user.get("avatar_url") or "https://a.ppy.sh/%s" % user.get("id")
+        data = self._download(avatar_url)
+        username = user.get("username") or ("ID %s" % user.get("id"))
+        path = os.path.join(image_dir, "%s avatar.png" % username)
+        if os.path.exists(path):
+            raise OsuApiError(0, "已存在同名文件：%s，已停止下载" % path)
+        try:
+            with open(path, "wb") as f:
+                f.write(data)
+        except OSError as exc:
+            raise OsuApiError(0, "无法写入文件：%s" % exc)
+        return path
+
+    def _apply_user_show(self, result):
+        mode, user, scores = result
+        text = format_user_profile(user, scores, mode, display=self._display_for(mode))
+        self._save_config()
+        messagebox.showinfo("玩家信息", text, parent=self.root)
+        self._set_status("已显示玩家信息：%s" % (user.get("username") or "?"))
+
+    def _apply_user_find(self, result):
+        typ, user = result
+        self._save_config()
+        username = user.get("username") or "?"
+        user_id = user.get("id")
+        found = str(user_id) if typ == "name" else username
+        messagebox.showinfo("查找结果", "玩家名：%s\n用户ID：%s" % (username, user_id), parent=self.root)
+        self._copy_text(found)
+        self._set_status("已查找：%s" % found)
+
+    def _apply_user_profile(self, result, output_mode, save_dir):
+        mode, user, scores = result
+        self._save_config()
+        text = format_user_profile(user, scores, mode, display=self._display_for(mode))
+        username = user.get("username") or "未知玩家"
+        if output_mode == "txt" and save_dir:
+            path = os.path.join(save_dir, user_profile_filename(username, mode))
+            if os.path.exists(path):
+                self._set_status("获取间隔过短")
+                messagebox.showwarning("提示", "获取间隔过短", parent=self.root)
+                return
+            try:
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+            except OSError as exc:
+                self._show_error("写入玩家资料失败", exc)
+                return
+            self._set_status("已保存玩家资料到 txt：%s" % path)
+            return
+        self._copy_text(text)
+        self._set_status("已复制玩家资料到剪贴板")
+
+    def _apply_user_avatar(self, path):
+        self._save_config()
+        self._set_status("已保存头像：%s" % path)
+
     # ---------- 谱面背景图 ----------
     def _resolve_image_dir(self):
-        """检查图片保存位置；未设置时提示并直接打开「获取与输出设置」。"""
+        """检查图片保存位置；统一位置优先。"""
+        if self.config.get("use_unified_dir"):
+            return self._resolve_unified_dir()
         image_dir = normalize_dir(self.config.get("image_dir"))
         if not image_dir:
             self._set_status("请设置下载路径后获取背景图")

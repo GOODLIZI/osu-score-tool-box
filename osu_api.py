@@ -162,6 +162,35 @@ class OsuApi:
             path += "/%s" % mode
         return self._call(path, account)
 
+    def get_user_lookup(self, account, identifier, mode=None):
+        """按用户 ID 或用户名查任意玩家（identifier 为字符串）。
+
+        osu! API 的 /users/{user} 同时接受数字 ID 与用户名（用户名大小写不敏感），
+        这里直接对 identifier 做 URL 编码后拼进路径。
+        """
+        path = "/users/%s" % urllib.parse.quote(str(identifier))
+        if mode:
+            path += "/%s" % mode
+        return self._call(path, account)
+
+    def get_best_scores_for(self, account, identifier, mode, limit=100, offset=0):
+        """获取任意玩家（按 ID 或用户名）的最佳成绩，按 pp 降序。
+
+        成绩接口只接受数字 ID；传入用户名时先解析为 ID。
+        """
+        ident = str(identifier)
+        if not ident.isdigit():
+            user = self.get_user_lookup(account, ident)
+            ident = str(user.get("id") or ident)
+        params = {"mode": mode, "limit": limit}
+        if offset:
+            params["offset"] = offset
+        return self._call(
+            "/users/%s/scores/best" % urllib.parse.quote(ident),
+            account,
+            params,
+        )
+
     def get_recent_scores(self, account, mode, limit=1, offset=0):
         # 默认同时返回 stable(legacy) 与 lazer(solo) 成绩；来源可通过成绩的 best_id 区分
         # 注意：最近成绩仅包含最近 24 小时，且 offset + limit 不能超过 100
