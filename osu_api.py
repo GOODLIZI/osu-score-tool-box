@@ -218,6 +218,15 @@ class OsuApi:
         """获取单个谱面信息（包含 beatmapset_id，用于定位背景图）。"""
         return self._call("/beatmaps/%s" % beatmap_id, account)
 
+    def get_user_beatmap_scores(self, account, beatmap_id, limit=100):
+        """获取指定用户在某谱面下的全部成绩（按分数降序，分页由 limit 控制）。"""
+        data = self._call(
+            "/beatmaps/%s/scores/users/%s/all" % (beatmap_id, account["user_id"]),
+            account,
+            {"limit": limit},
+        )
+        return data.get("scores") or []
+
     def get_beatmap_attributes(self, account, beatmap_id, mods, ruleset=None):
         """获取指定谱面在给定模组下的难度属性，返回带模组星数（star_rating）。
 

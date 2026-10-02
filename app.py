@@ -78,6 +78,9 @@ STAR_STYLE_LABELS = {"default": "默认（4.76★）", "asterisk": "星号显示
 # DT/NC/HT 的默认倍速（lazer 中可自定义倍速）
 _RATE_MOD_DEFAULT_SPEED = {"DT": 1.5, "NC": 1.5, "HT": 0.75}
 
+# /s 指令的“最佳成绩类型”：pp / acc / score（分数）
+BEATMAP_BEST_LABELS = {"pp": "PP", "acc": "ACC", "score": "分数"}
+
 # 成绩获取默认数量：按模式分别保存（recent = 最近成绩条数，best = 最佳成绩条数）
 FETCH_LIMIT_MAX = 100
 FETCH_KINDS = ("recent", "best")
@@ -242,6 +245,18 @@ COMMAND_SPECS = [
             ("/user profile name|id 玩家名/玩家ID [-copy|-txt]", "输出玩家信息到剪贴板/txt"),
         ],
     },
+    {
+        "name": "/s",
+        "kind": "beatmap_best",
+        "arg_mode": "beatmap_best",
+        "min_args": 2,
+        "max_args": 2,
+        "forms": [
+            ("/s pp 谱面编号", "获取你在该谱面的最佳 pp 成绩（复制到剪贴板）"),
+            ("/s acc 谱面编号", "获取你在该谱面的最佳 acc 成绩（复制到剪贴板）"),
+            ("/s score 谱面编号", "获取你在该谱面的最佳分数成绩（复制到剪贴板）"),
+        ],
+    },
 ]
 
 COMMAND_RULES = [
@@ -353,6 +368,19 @@ def parse_command(text):
         if typ == "id" and not value.isdigit():
             raise CommandError("玩家ID必须是正整数：%s" % value)
         return spec, [sub, typ, value], output_override, None
+    if spec.get("arg_mode") == "beatmap_best":
+        # /s pp|acc|score 谱面编号
+        typ = raw_args[0].lower()
+        if typ not in BEATMAP_BEST_LABELS:
+            raise CommandError("/s 的最佳成绩类型必须是 pp、acc 或 score（例如 /s pp 1234567）。")
+        number_raw = raw_args[1]
+        try:
+            beatmap_id = int(number_raw)
+        except ValueError:
+            raise CommandError("谱面编号必须是正整数：%s" % number_raw)
+        if beatmap_id < 1:
+            raise CommandError("谱面编号必须是正整数：%s" % number_raw)
+        return spec, [typ, beatmap_id], None, None
     args = []
     for raw in raw_args:
         stripped = raw.strip().lower()
@@ -630,18 +658,25 @@ def format_mods(score):
     return "+".join(parts) or "NM"
 
 
+def _floor2(x):
+    """向下取整到两位小数，匹配 osu! 的显示规则（Math.Floor(x*100)/100）。"""
+    return math.floor(x * 100 + 1e-9) / 100
+
+
 def format_acc(score, style="percent"):
-    """ACC 显示方式：percent -> 96.17%，plain -> 96.17，digits4 -> 9617。"""
+    """ACC 显示方式：percent -> 96.17%，plain -> 96.17，digits4 -> 9617。
+
+    osu! 显示规则：百分比向下取整到两位小数（而非四舍五入）。
+    """
     acc = score.get("accuracy")
     if not isinstance(acc, (int, float)):
         return "?"
     acc_pct = acc * 100 if acc <= 1 else acc  # API 的 accuracy 是 0~1 的小数
-    if style == "plain":
-        return "%.2f" % acc_pct
     if style == "digits4":
-        # 百分数去掉小数点后取整（半进位），不补前导零
-        return "%d" % int(math.floor(acc_pct * 100 + 0.5))
-    return "%.2f%%" % acc_pct
+        return "%d" % int(_floor2(acc_pct) * 100)
+    if style == "plain":
+        return "%.2f" % _floor2(acc_pct)
+    return "%.2f%%" % _floor2(acc_pct)
 
 
 def format_pp(score, style="int"):
@@ -675,6 +710,14 @@ def format_mapper(score):
     beatmapset = score.get("beatmapset") or {}
     creator = beatmapset.get("creator")
     return creator.strip() if isinstance(creator, str) and creator.strip() else ""
+
+
+def _score_value(score):
+    """成绩的显示分数值：优先 total_score（int>0），否则 score（可能为 None）。"""
+    total = score.get("total_score")
+    if isinstance(total, int) and total > 0:
+        return total
+    return score.get("score")
 
 
 def render_field(field, score, display):
@@ -714,12 +757,11 @@ def render_field(field, score, display):
             stars = beatmap.get("difficulty_rating")
         if not isinstance(stars, (int, float)):
             return ["?"]
-        return ["%.2f%s" % (stars, star_suffix(display.get("star_style", "default")))]
+        return ["%.2f%s" % (_floor2(stars), star_suffix(display.get("star_style", "default")))]
     if field == "mods":
         return [format_mods(score)]
     if field == "score":
-        total_score = score.get("total_score")
-        score_val = total_score if isinstance(total_score, int) and total_score > 0 else score.get("score")
+        score_val = _score_value(score)
         if isinstance(score_val, int):
             return [str(score_val)]
         return [str(score_val) if score_val else "?"]
@@ -768,7 +810,7 @@ def format_user_profile(user, scores, mode, display=None):
         "用户ID：%s" % (user.get("id") or "?"),
         "模式：%s" % MODE_UI_NAMES.get(mode, str(mode)),
         "PP：%s" % ("N/A" if pp is None else pp),
-        "ACC：%s" % ("N/A" if acc is None else "%.2f%%" % acc),
+        "ACC：%s" % ("N/A" if acc is None else "%.2f%%" % _floor2(acc)),
         "游玩时长：%s" % format_duration(stats.get("play_time")),
         "游玩次数：%s" % ("N/A" if play_count is None else play_count),
         "地区：%s" % country_name(user.get("country_code")),
@@ -1350,6 +1392,58 @@ class UserQueryDialog:
         self.app._run_user_action(action, typ, value)
 
 
+class BeatmapScoreDialog:
+    """「指定谱面成绩获取」弹窗：输入谱面编号与最佳成绩类型（仅输出到剪贴板）。"""
+
+    def __init__(self, parent):
+        self.result = None
+        self.window = tk.Toplevel(parent)
+        self.window.title("指定谱面成绩获取")
+        self.window.geometry("460x240")
+        self.window.minsize(440, 220)
+        self.window.transient(parent)
+        self.window.grab_set()
+
+        body = ttk.Frame(self.window, padding=12)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(body, text="谱面编号：").grid(row=0, column=0, sticky="w", pady=6)
+        self.id_var = tk.StringVar()
+        entry = ttk.Entry(body, textvariable=self.id_var, width=20)
+        entry.grid(row=0, column=1, sticky="w", pady=6)
+        entry.focus_set()
+        entry.bind("<Return>", lambda event: self._ok())
+
+        ttk.Label(body, text="最佳成绩类型：").grid(row=1, column=0, sticky="w", pady=6)
+        self.kind_var = tk.StringVar(value="pp")
+        kind_box = ttk.Frame(body)
+        kind_box.grid(row=1, column=1, sticky="w", pady=6)
+        for i, kind in enumerate(BEATMAP_BEST_LABELS):
+            ttk.Radiobutton(kind_box, text=BEATMAP_BEST_LABELS[kind], value=kind,
+                            variable=self.kind_var).grid(row=0, column=i, padx=(0, 12))
+
+        ttk.Label(body, text="仅输出到剪贴板。", foreground="#666").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        buttons = ttk.Frame(self.window, padding=10)
+        buttons.pack(fill="x", side="bottom")
+        ttk.Button(buttons, text="关闭", command=self.window.destroy).pack(side="right", padx=4)
+        ttk.Button(buttons, text="获取", command=self._ok).pack(side="right", padx=4)
+
+    def _ok(self):
+        raw = (self.id_var.get() or "").strip()
+        try:
+            beatmap_id = int(raw)
+        except ValueError:
+            messagebox.showwarning("指定谱面成绩获取", "请输入有效的谱面编号（正整数）。", parent=self.window)
+            return
+        if beatmap_id < 1:
+            messagebox.showwarning("指定谱面成绩获取", "谱面编号必须是正整数。", parent=self.window)
+            return
+        self.result = (beatmap_id, self.kind_var.get())
+        self.window.destroy()
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -1453,6 +1547,7 @@ class App:
         self.more_menu = tk.Menu(self.root, tearoff=0)
         self.more_menu.add_command(label="用户查询功能", command=self.on_user_query)
         self.more_menu.add_command(label="获取谱面背景图", command=self.on_get_background)
+        self.more_menu.add_command(label="指定谱面成绩获取", command=self.on_beatmap_best)
 
         # 指令输入
         cmd = ttk.Frame(self.root, padding=8)
@@ -1550,7 +1645,7 @@ class App:
 
     @staticmethod
     def _fmt_percent(v):
-        return "N/A" if v is None else "%.2f%%" % v
+        return "N/A" if v is None else "%.2f%%" % _floor2(v)
 
     @staticmethod
     def _fmt_rank(v):
@@ -1788,6 +1883,10 @@ class App:
             sub, typ, value = args
             self._run_user_action(sub, typ, value, override)
             return
+        if spec["kind"] == "beatmap_best":
+            typ, beatmap_id = args
+            self._run_beatmap_best(typ, beatmap_id)
+            return
         try:
             offset, limit = resolve_range(spec, args)
         except CommandError as exc:
@@ -1987,6 +2086,58 @@ class App:
     def on_user_query(self):
         dialog = UserQueryDialog(self.root, self)
         self.root.wait_window(dialog.window)
+
+    def on_beatmap_best(self):
+        dialog = BeatmapScoreDialog(self.root)
+        self.root.wait_window(dialog.window)
+        if not dialog.result:
+            return
+        beatmap_id, typ = dialog.result
+        self._run_beatmap_best(typ, beatmap_id)
+
+    def _run_beatmap_best(self, typ, beatmap_id):
+        account = self._require_account()
+        if not account:
+            return
+        label = BEATMAP_BEST_LABELS.get(typ, typ)
+        self._set_status("正在获取谱面 %d 的最佳%s成绩…" % (beatmap_id, label))
+        self._background(
+            lambda: self._fetch_beatmap_best(account, beatmap_id, typ),
+            self._apply_beatmap_best,
+            error_msg="获取谱面成绩失败",
+        )
+
+    def _fetch_beatmap_best(self, account, beatmap_id, typ):
+        bm = self.api.get_beatmap(account, beatmap_id)
+        beatmapset = bm.get("beatmapset") or {}
+        try:
+            scores = self.api.get_user_beatmap_scores(account, beatmap_id)
+        except OsuApiError as exc:
+            if exc.code == 404:
+                raise OsuApiError(0, "该谱面没有排行榜（可能未 Ranked），无法查询成绩")
+            raise
+        if not scores:
+            raise OsuApiError(0, "你在该谱面暂无成绩")
+        for score in scores:
+            score["beatmap"] = bm
+            score["beatmapset"] = beatmapset
+        if typ == "pp":
+            best = max(scores, key=lambda s: s.get("pp") if isinstance(s.get("pp"), (int, float)) else -1.0)
+        elif typ == "acc":
+            best = max(scores, key=lambda s: s.get("accuracy") if isinstance(s.get("accuracy"), (int, float)) else -1.0)
+        else:
+            best = max(scores, key=lambda s: _score_value(s) or 0)
+        self._enrich_star_ratings(account, [best])
+        return typ, best
+
+    def _apply_beatmap_best(self, result):
+        typ, best = result
+        mode = (best.get("beatmap") or {}).get("mode")
+        display = self._display_for(mode) if mode in MODES else None
+        text = format_score_line(best, display=display)
+        self._save_config()
+        self._copy_text(text)
+        self._set_status("已复制谱面最佳%s成绩到剪贴板" % BEATMAP_BEST_LABELS.get(typ, typ))
 
     def _run_user_action(self, action, typ, value, output_override=None):
         """用户查询动作分发：show / find / avatar / profile。"""
