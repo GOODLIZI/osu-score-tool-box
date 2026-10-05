@@ -12,6 +12,7 @@ import json
 import math
 import os
 import secrets
+import sys
 import threading
 import time
 import urllib.parse
@@ -27,7 +28,13 @@ from PIL import Image, ImageTk
 
 from osu_api import BACKGROUND_KINDS, MODES, MODE_NAMES, RULESET_IDS, OsuApi, OsuApiError, background_urls
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# 打包成 exe 后（sys.frozen=True），__file__ 指向临时解压目录；改用 exe 所在目录，
+# 让 config.json 与 exe 同级，配置才能持久保存。
+if getattr(sys, "frozen", False):
+    _APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(_APP_DIR, "config.json")
 DEFAULT_REDIRECT_URI = "http://127.0.0.1:5050/callback"
 
 # 常用地区代码 -> 中文名（未知代码直接显示代码本身）
@@ -174,6 +181,9 @@ def normalize_config(config):
     config["output_mode"] = normalize_output_mode(config.get("output_mode"))
     config["use_unified_dir"] = _as_bool(config.get("use_unified_dir"), False)
     config["unified_dir"] = normalize_dir(config.get("unified_dir"))
+    for account in config.get("accounts") or []:
+        if isinstance(account, dict):
+            account.setdefault("favorite_users", [])
     return config
 
 
@@ -424,6 +434,40 @@ def command_help_text():
     lines.append("通用规则：")
     lines.extend("  · " + rule for rule in COMMAND_RULES)
     return "\n".join(lines)
+
+
+ACCOUNT_HELP_TEXT = """账号绑定帮助
+
+一、注册 osu! OAuth 应用（只需一次）
+1. 登录 osu! 官网 https://osu.ppy.sh/ ，进入「账号设置 → OAuth」页面
+   （https://osu.ppy.sh/home/account/edit#oauth）。
+2. 点击 Register new application。
+3. Application Name 可随意填写（例如 osu-scores-tool）。
+4. Application Callback URL 必须填写：http://127.0.0.1:5050/callback
+   （必须与程序中的回调地址完全一致）。
+5. 保存后，记录页面上的 Client ID 与 Client Secret
+   （Secret 相当于密码，请勿泄露给他人）。
+
+二、在程序中填写 API 设置
+1. 打开程序，点击顶部「API设置」。
+2. 将上面拿到的 Client ID、Client Secret 填入对应输入框。
+3. 回调地址保持 http://127.0.0.1:5050/callback（一般无需改动）。
+4. 点击保存。
+
+三、绑定账号
+1. 点击顶部「绑定账号」。
+2. 程序会自动打开浏览器并跳转到 osu! 授权页面。
+3. 在浏览器中登录你的 osu! 账号，并点击授权（Authorize / 同意）。
+4. 授权完成后回到程序，账号即绑定成功，主界面会显示该账号信息。
+
+四、配置文件（config.json）的位置说明
+- 程序的所有设置、已绑定账号与登录令牌都保存在 config.json 中。
+- config.json 必须与程序在同一目录：
+  · 使用 .exe 运行时：config.json 需放在 .exe 文件旁边。
+  · 使用 run.bat 运行时：config.json 需放在 app.py / run.bat 所在目录。
+- 首次运行会自动生成 config.json；移动程序时请把 config.json 一并移动，
+  否则账号绑定与各项设置会丢失。
+"""
 
 
 def default_display_settings():
@@ -677,6 +721,75 @@ def format_acc(score, style="percent"):
     if style == "plain":
         return "%.2f" % _floor2(acc_pct)
     return "%.2f%%" % _floor2(acc_pct)
+
+
+# ---------------------------------------------------------------- ACC 计算
+# 「更多功能 → ACC 计算」：按判定计数计算各模式 acc（与 osu! 官方规则一致）。
+ACC_INPUT_FIELDS = {
+    "osu": [("n300", "300"), ("n100", "100"), ("n50", "50"), ("nmiss", "miss")],
+    "taiko": [("ngreat", "良 GREAT"), ("ngood", "可 GOOD"), ("nmiss", "miss")],
+    "fruits": [("ncaught", "接住数（水果+雨滴）"), ("nmiss", "漏接数 miss")],
+    "mania": [("nmax", "MAX"), ("n300", "300"), ("n200", "200"),
+              ("n100", "100"), ("n50", "50"), ("nmiss", "miss")],
+}
+
+
+def _count(values, key):
+    """从判定计数 dict 中取非负整数；非法/缺失返回 0。"""
+    val = values.get(key)
+    if isinstance(val, (int, float)) and val >= 0:
+        return int(val)
+    return 0
+
+
+def compute_acc(mode, values, mania_style="v2"):
+    """按判定计数计算 acc，返回 0~1 的小数（与 API accuracy 字段一致）。
+
+    mode: osu / taiko / fruits / mania
+    values: 判定计数 dict（键见 ACC_INPUT_FIELDS）
+    mania_style: "v1"（stable，MAX 与 300 同权）或 "v2"（lazer，MAX 按 305 计、黄300扣 acc）
+    无法计算（总判定为 0 或未知模式）时返回 None。
+    """
+    if mode == "osu":
+        n300 = _count(values, "n300")
+        n100 = _count(values, "n100")
+        n50 = _count(values, "n50")
+        nmiss = _count(values, "nmiss")
+        total = n300 + n100 + n50 + nmiss
+        if total <= 0:
+            return None
+        return (300 * n300 + 100 * n100 + 50 * n50) / (300 * total)
+    if mode == "taiko":
+        ngreat = _count(values, "ngreat")
+        ngood = _count(values, "ngood")
+        nmiss = _count(values, "nmiss")
+        total = ngreat + ngood + nmiss
+        if total <= 0:
+            return None
+        return (ngreat + 0.5 * ngood) / total
+    if mode == "fruits":
+        ncaught = _count(values, "ncaught")
+        nmiss = _count(values, "nmiss")
+        total = ncaught + nmiss
+        if total <= 0:
+            return None
+        return ncaught / total
+    if mode == "mania":
+        nmax = _count(values, "nmax")
+        n300 = _count(values, "n300")
+        n200 = _count(values, "n200")
+        n100 = _count(values, "n100")
+        n50 = _count(values, "n50")
+        nmiss = _count(values, "nmiss")
+        total = nmax + n300 + n200 + n100 + n50 + nmiss
+        if total <= 0:
+            return None
+        if mania_style == "v1":
+            # stable：MAX 与 300 同权（都按 300 计）
+            return (300 * (nmax + n300) + 200 * n200 + 100 * n100 + 50 * n50) / (300 * total)
+        # lazer v2：MAX 按 305 计（黄300 约 98.36%）
+        return (305 * nmax + 300 * n300 + 200 * n200 + 100 * n100 + 50 * n50) / (305 * total)
+    return None
 
 
 def format_pp(score, style="int"):
@@ -1340,14 +1453,15 @@ class BackgroundDialog:
 
 
 class UserQueryDialog:
-    """「用户查询」弹窗：按名字/ID 查看信息、查找、下载头像、输出资料。"""
+    """「用户查询」弹窗：按名字/ID 查看信息、查找、下载头像、输出资料，并支持收藏用户。"""
 
     def __init__(self, parent, app):
         self.app = app
+        self.fav_items = []
         self.window = tk.Toplevel(parent)
         self.window.title("用户查询")
-        self.window.geometry("460x240")
-        self.window.minsize(440, 220)
+        self.window.geometry("560x300")
+        self.window.minsize(540, 280)
         self.window.transient(parent)
         self.window.grab_set()
 
@@ -1362,11 +1476,17 @@ class UserQueryDialog:
         ttk.Radiobutton(type_box, text="按玩家ID", value="id", variable=self.type_var).grid(row=0, column=1)
 
         ttk.Label(body, text="玩家名/ID：").grid(row=1, column=0, sticky="w", pady=6)
+        input_box = ttk.Frame(body)
+        input_box.grid(row=1, column=1, sticky="w", pady=6)
         self.value_var = tk.StringVar()
-        entry = ttk.Entry(body, textvariable=self.value_var, width=24)
-        entry.grid(row=1, column=1, sticky="w", pady=6)
+        entry = ttk.Entry(input_box, textvariable=self.value_var, width=20)
+        entry.pack(side="left", padx=(0, 8))
         entry.focus_set()
         entry.bind("<Return>", lambda e: self._dispatch("show"))
+        ttk.Label(input_box, text="收藏用户：").pack(side="left")
+        self.fav_combo = ttk.Combobox(input_box, state="readonly", width=16)
+        self.fav_combo.pack(side="left", padx=(2, 0))
+        self.fav_combo.bind("<<ComboboxSelected>>", self._on_fav_selected)
 
         actions = ttk.Frame(body)
         actions.grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
@@ -1375,9 +1495,61 @@ class UserQueryDialog:
         ttk.Button(actions, text="下载头像", command=lambda: self._dispatch("avatar")).pack(side="left", padx=(0, 6))
         ttk.Button(actions, text="输出资料", command=lambda: self._dispatch("profile")).pack(side="left")
 
+        fav_actions = ttk.Frame(body)
+        fav_actions.grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Button(fav_actions, text="收藏用户", command=self._add_favorite).pack(side="left", padx=(0, 6))
+        ttk.Button(fav_actions, text="删除收藏", command=self._delete_favorite).pack(side="left")
+
         buttons = ttk.Frame(self.window, padding=10)
         buttons.pack(fill="x", side="bottom")
         ttk.Button(buttons, text="关闭", command=self.window.destroy).pack(side="right", padx=4)
+
+        self._refresh_favorites()
+
+    def _refresh_favorites(self):
+        account = self.app.current_account
+        favs = (account or {}).get("favorite_users") or []
+        self.fav_items = favs
+        labels = ["%s (%s)" % (f.get("username") or "?", f.get("id")) for f in favs]
+        self.fav_combo.config(values=labels)
+        self.fav_combo.set("")
+
+    def _on_fav_selected(self, event=None):
+        idx = self.fav_combo.current()
+        if idx < 0 or idx >= len(self.fav_items):
+            return
+        item = self.fav_items[idx]
+        if self.type_var.get() == "id":
+            self.value_var.set(str(item.get("id")))
+        else:
+            self.value_var.set(item.get("username") or "")
+
+    def _add_favorite(self):
+        account = self.app._require_account()
+        if not account:
+            messagebox.showwarning("收藏用户", "请先绑定并选择一个账号。", parent=self.window)
+            return
+        value = simpledialog.askstring("收藏用户", "请输入玩家名或玩家ID：", parent=self.window)
+        if value is None:
+            return
+        value = value.strip()
+        if not value:
+            messagebox.showwarning("收藏用户", "请输入玩家名或玩家ID。", parent=self.window)
+            return
+        self.app._run_add_favorite(account, value, self._refresh_favorites)
+
+    def _delete_favorite(self):
+        account = self.app._require_account()
+        if not account:
+            messagebox.showwarning("删除收藏", "请先绑定并选择一个账号。", parent=self.window)
+            return
+        idx = self.fav_combo.current()
+        if idx < 0 or idx >= len(self.fav_items):
+            messagebox.showwarning("删除收藏", "请先在收藏用户下拉中选择要删除的用户。", parent=self.window)
+            return
+        item = self.fav_items[idx]
+        self.app._remove_favorite(account, item.get("id"))
+        self._refresh_favorites()
 
     def _dispatch(self, action):
         typ = self.type_var.get()
@@ -1390,8 +1562,6 @@ class UserQueryDialog:
             return
         self.window.destroy()
         self.app._run_user_action(action, typ, value)
-
-
 class BeatmapScoreDialog:
     """「指定谱面成绩获取」弹窗：输入谱面编号与最佳成绩类型（仅输出到剪贴板）。"""
 
@@ -1442,6 +1612,108 @@ class BeatmapScoreDialog:
             return
         self.result = (beatmap_id, self.kind_var.get())
         self.window.destroy()
+
+
+class AccCalcDialog:
+    """「ACC 计算」弹窗：选择模式并输入判定计数，计算该成绩的 acc。"""
+
+    def __init__(self, parent):
+        self.window = tk.Toplevel(parent)
+        self.window.title("ACC 计算")
+        self.window.geometry("440x420")
+        self.window.minsize(420, 380)
+        self.window.transient(parent)
+        self.window.grab_set()
+
+        self.entries = {}
+        self.mania_style = tk.StringVar(value="v2")
+
+        body = ttk.Frame(self.window, padding=12)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(body, text="模式：").grid(row=0, column=0, sticky="nw", pady=6)
+        mode_box = ttk.Frame(body)
+        mode_box.grid(row=0, column=1, sticky="w", pady=6)
+        self.mode_var = tk.StringVar(value="osu")
+        for i, mode in enumerate(MODES):
+            ttk.Radiobutton(mode_box, text=MODE_UI_NAMES.get(mode, mode), value=mode,
+                            variable=self.mode_var, command=self._on_mode_changed).grid(
+                row=i // 2, column=i % 2, sticky="w", padx=(0, 18), pady=2)
+
+        self.inputs_frame = ttk.Frame(body)
+        self.inputs_frame.grid(row=1, column=0, columnspan=2, sticky="nw")
+
+        ttk.Label(body, text="判定计数：").grid(row=2, column=0, columnspan=2,
+                                                 sticky="w", pady=(12, 0))
+
+        self.mania_box = ttk.Frame(body)
+        self.mania_box.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(self.mania_box, text="mania 计分版本：").pack(side="left")
+        ttk.Radiobutton(self.mania_box, text="V1（stable）", value="v1",
+                        variable=self.mania_style).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(self.mania_box, text="V2（lazer）", value="v2",
+                        variable=self.mania_style).pack(side="left")
+
+        self.result_label = ttk.Label(body, text="", font=("Microsoft YaHei UI", 13, "bold"),
+                                      foreground="#0055aa")
+        self.result_label.grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+        buttons = ttk.Frame(self.window, padding=10)
+        buttons.pack(fill="x", side="bottom")
+        ttk.Button(buttons, text="关闭", command=self.window.destroy).pack(side="right", padx=4)
+        ttk.Button(buttons, text="计算", command=self._calc).pack(side="right", padx=4)
+
+        self._build_inputs()
+
+    def _on_mode_changed(self):
+        self._build_inputs()
+
+    def _build_inputs(self):
+        for child in self.inputs_frame.winfo_children():
+            child.destroy()
+        mode = self.mode_var.get()
+        self.entries = {}
+        fields = ACC_INPUT_FIELDS.get(mode, [])
+        for i, (key, label) in enumerate(fields):
+            ttk.Label(self.inputs_frame, text="%s：" % label).grid(
+                row=i, column=0, sticky="e", padx=(0, 8), pady=3)
+            var = tk.StringVar(value="0")
+            entry = ttk.Entry(self.inputs_frame, textvariable=var, width=12, justify="right")
+            entry.grid(row=i, column=1, sticky="w", pady=3)
+            entry.bind("<Return>", lambda event: self._calc())
+            self.entries[key] = var
+        if mode == "mania":
+            self.mania_box.grid()
+        else:
+            self.mania_box.grid_remove()
+        self.result_label.config(text="")
+        if mode == "osu":
+            hint = "仅 stable 适用"
+        elif mode == "fruits":
+            hint = "香蕉（banana）不计入 acc。"
+        else:
+            hint = ""
+        if hint:
+            ttk.Label(self.inputs_frame, text=hint, foreground="#666").grid(
+                row=len(fields), column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+    def _calc(self):
+        mode = self.mode_var.get()
+        values = {}
+        try:
+            for key, var in self.entries.items():
+                num = int((var.get() or "").strip())
+                if num < 0:
+                    raise ValueError
+                values[key] = num
+        except ValueError:
+            messagebox.showwarning("ACC 计算", "请输入非负整数。", parent=self.window)
+            return
+        acc = compute_acc(mode, values, self.mania_style.get())
+        if acc is None:
+            self.result_label.config(text="总判定数不能为 0。", foreground="#990000")
+            return
+        self.result_label.config(text="ACC = %.2f%%" % _floor2(acc * 100), foreground="#0055aa")
 
 
 class App:
@@ -1548,6 +1820,7 @@ class App:
         self.more_menu.add_command(label="用户查询功能", command=self.on_user_query)
         self.more_menu.add_command(label="获取谱面背景图", command=self.on_get_background)
         self.more_menu.add_command(label="指定谱面成绩获取", command=self.on_beatmap_best)
+        self.more_menu.add_command(label="ACC 计算", command=self.on_acc_calc)
 
         # 指令输入
         cmd = ttk.Frame(self.root, padding=8)
@@ -1558,7 +1831,12 @@ class App:
         self.command_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.command_entry.bind("<Return>", lambda event: self.on_run_command())
         ttk.Button(cmd, text="执行", command=self.on_run_command).pack(side="left", padx=(0, 6))
-        ttk.Button(cmd, text="指令帮助", command=self.on_command_help).pack(side="left")
+        self.help_button = ttk.Button(cmd, text="帮助", command=self.on_help_menu)
+        self.help_button.pack(side="left")
+        # 「帮助」下拉菜单
+        self.help_menu = tk.Menu(self.root, tearoff=0)
+        self.help_menu.add_command(label="指令帮助", command=self.on_command_help)
+        self.help_menu.add_command(label="账号绑定帮助", command=self.on_account_help)
 
         # 底部：状态栏 + 右下角「删除账号」（标红，降低误触风险）
         bottom = ttk.Frame(self.root)
@@ -1924,8 +2202,20 @@ class App:
             error_msg="获取成绩失败",
         )
 
+    def on_help_menu(self):
+        """弹出「帮助」下拉菜单。"""
+        x = self.help_button.winfo_rootx()
+        y = self.help_button.winfo_rooty() + self.help_button.winfo_height()
+        try:
+            self.help_menu.tk_popup(x, y)
+        finally:
+            self.help_menu.grab_release()
+
     def on_command_help(self):
         messagebox.showinfo("指令帮助", command_help_text(), parent=self.root)
+
+    def on_account_help(self):
+        messagebox.showinfo("账号绑定帮助", ACCOUNT_HELP_TEXT, parent=self.root)
 
     # ---------- 剪贴板 ----------    # ---------- 剪贴板 ----------
     def _copy_text(self, text):
@@ -2095,6 +2385,10 @@ class App:
         beatmap_id, typ = dialog.result
         self._run_beatmap_best(typ, beatmap_id)
 
+    def on_acc_calc(self):
+        dialog = AccCalcDialog(self.root)
+        self.root.wait_window(dialog.window)
+
     def _run_beatmap_best(self, typ, beatmap_id):
         account = self._require_account()
         if not account:
@@ -2185,6 +2479,43 @@ class App:
         """查找任意玩家，返回 (typ, user)。"""
         user = self.api.get_user_lookup(account, value)
         return typ, user
+
+    def _fetch_favorite_user(self, account, value):
+        """查询收藏候选用户是否存在，返回 user；404 转为友好提示。"""
+        try:
+            return self.api.get_user_lookup(account, value)
+        except OsuApiError as exc:
+            if exc.code == 404:
+                raise OsuApiError(0, "用户不存在，请检查输入的玩家名或玩家ID。")
+            raise
+
+    def _run_add_favorite(self, account, value, on_success=None):
+        """后台校验用户存在后添加到收藏，成功后经主线程回调 on_success 刷新下拉。"""
+        self._set_status("正在查询用户（%s）…" % value)
+        self._background(
+            lambda: self._fetch_favorite_user(account, value),
+            lambda user: self._apply_add_favorite(account, user, on_success),
+            error_msg="收藏用户失败",
+        )
+
+    def _apply_add_favorite(self, account, user, on_success=None):
+        favs = account.setdefault("favorite_users", [])
+        uid = user.get("id")
+        if any(f.get("id") == uid for f in favs):
+            self._set_status("该用户已在收藏中")
+            messagebox.showinfo("收藏用户", "该用户已在收藏中。", parent=self.root)
+            return
+        favs.append({"id": uid, "username": user.get("username") or ("ID %s" % uid)})
+        self._save_config()
+        self._set_status("已收藏用户：%s" % (user.get("username") or uid))
+        if on_success:
+            on_success()
+
+    def _remove_favorite(self, account, uid):
+        account.setdefault("favorite_users", [])
+        account["favorite_users"] = [f for f in account["favorite_users"] if f.get("id") != uid]
+        self._save_config()
+        self._set_status("已取消收藏")
 
     def _fetch_user_info(self, account, value, mode):
         """获取任意玩家信息 + 前 5 个最佳成绩，返回 (mode, user, scores)。"""
